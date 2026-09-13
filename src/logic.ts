@@ -108,7 +108,8 @@ export interface AuditEntry {
   mode: ToolfaceMode
   applied: boolean
   deniedCount: number
-  totalTools: number
+  /** 全局面可见工具数（preset 作用域读到的 schemas() 是全局视图，非本会话可见数）。 */
+  globalTools: number
   savedTokens: number
   unmatched: readonly string[]
   reason?: string
@@ -126,7 +127,7 @@ export function auditLine(entry: AuditEntry): string {
     mode: entry.mode,
     applied: entry.applied,
     deniedCount: entry.deniedCount,
-    totalTools: entry.totalTools,
+    globalTools: entry.globalTools,
     savedTokens: entry.savedTokens,
     unmatched: [...entry.unmatched],
   }

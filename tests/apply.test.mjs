@@ -97,6 +97,6 @@ test('apply：审计行落盘且可回读（含 applied/deniedCount/savedTokens�
   assert.equal(entry.mode, 'lean')
   assert.equal(entry.applied, true)
   assert.equal(entry.deniedCount, 2)
-  assert.equal(entry.totalTools, SCHEMAS.length)
+  assert.equal(entry.globalTools, SCHEMAS.length)
   assert.ok(entry.savedTokens > 0)
 })

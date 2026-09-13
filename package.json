@@ -1,6 +1,6 @@
 {
     "name":  "dsh-agent-toolface",
-    "version":  "0.1.0",
+    "version":  "0.1.1",
     "description":  "工具面分档：在 agent 作用域内按证据化的 deny 集收窄模型可见工具（lean/full 一键切换 + 审计留痕），降低工具 schema 的固定上下文成本与选择稀释。",
     "type":  "module",
     "main":  "lib/index.js",

@@ -87,7 +87,7 @@ test('auditLine：单行 JSON、以换行结尾、字段可回读', () => {
     mode: 'lean',
     applied: true,
     deniedCount: 63,
-    totalTools: 274,
+    globalTools: 274,
     savedTokens: 7708,
     unmatched: ['zzz_*'],
   })
@@ -97,6 +97,7 @@ test('auditLine：单行 JSON、以换行结尾、字段可回读', () => {
   assert.equal(parsed.action, 'lean')
   assert.equal(parsed.applied, true)
   assert.equal(parsed.deniedCount, 63)
+  assert.equal(parsed.globalTools, 274)
   assert.equal(parsed.savedTokens, 7708)
   assert.deepEqual(parsed.unmatched, ['zzz_*'])
   assert.equal('reason' in parsed, false)
@@ -105,7 +106,7 @@ test('auditLine：单行 JSON、以换行结尾、字段可回读', () => {
 test('auditLine：reason 存在时才写入该字段', () => {
   const parsed = JSON.parse(auditLine({
     at: 't', action: 'load', mode: 'full', applied: false,
-    deniedCount: 0, totalTools: 3, savedTokens: 0, unmatched: [], reason: '示例原因',
+    deniedCount: 0, globalTools: 3, savedTokens: 0, unmatched: [], reason: '示例原因',
   }))
   assert.equal(parsed.reason, '示例原因')
   assert.equal(parsed.mode, 'full')

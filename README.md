@@ -40,7 +40,9 @@
 | `action` | `status` 查看 / `lean` 收窄 / `full` 恢复全量 |
 | `deny` | 可选，`lean` 时覆盖配置的模式（精确名或尾随 `*` 前缀） |
 
-返回：`{ ok, mode, applied, deniedCount, totalTools, savedChars, savedTokens, unmatched[], reason? }`。
+返回：`{ ok, mode, applied, deniedCount, globalTools, savedChars, savedTokens, unmatched[], reason? }`。
+
+> `globalTools` 是**全局面**工具数（preset 作用域读到的 `schemas()` 是全局视图，含其他预设挂载的工具），不是本会话的模型可见数——后者由请求头 `tools` 实测（本机：收窄前 274 → 收窄后 208）。
 
 ## 技术要点
 

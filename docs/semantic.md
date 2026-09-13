@@ -65,7 +65,9 @@
 | `action` | string（必填） | `status` 查看 / `lean` 收窄 / `full` 全量 |
 | `deny` | string[] | 可选，`lean` 时覆盖配置的 deny 模式（本次会话内有效） |
 
-返回：`{ ok, mode, applied, deniedCount, totalTools, savedChars, savedTokens, unmatched[], reason? }`。
+返回：`{ ok, mode, applied, deniedCount, globalTools, savedChars, savedTokens, unmatched[], reason? }`。
+
+`globalTools` 是**全局面**计数（preset 作用域的 `schemas()` 是全局视图）；**本会话模型可见数**由请求头实测，不由本工具报告（见 §9 实践修订 ①）。
 
 **宿主契约（调用点清单）**
 
@@ -89,14 +91,14 @@
 
 | # | 验收（一次测量可判真假） | 状态 |
 |---|--------------------------|------|
-| 1 | 加载后模型可见工具数从 274 降到 ≤211（收窄 63 个），可由会话日志 `request/header` 实测 | 待线上验收 |
-| 2 | `toolface action=full` 后重新请求的工具数为 274（全量恢复） | 待线上验收 |
+| 1 | 加载后模型可见工具数从 274 降到 ≤211，可由会话日志 `request/header` 实测 | **已线上验证**（2026-09-13 08:55 重启后：274 → **208** = 274 − 67 + 1 个 toolface；122,076 → 91,682 字符 ≈ 30,519 → 22,925 tok） |
+| 2 | `toolface action=full` 后重新请求的工具数为 274 + 1 | **已线上验证**（同日 08:56：**275** 个 / 122,579 字符 ≈ 30,649 tok），随后已切回 lean |
 | 3 | 未命中模式（配置含 `zzz_*`）不导致插件加载失败，且出现在 `status.unmatched` | 单测覆盖 |
 | 4 | deny 为空时**不调用** `restrict`（避免宿主 `restrict({})` 抛错） | 单测覆盖 |
 | 5 | `restrict` 抛错时插件仍加载，`status.applied=false` 且 `reason` 非空 | 单测覆盖（fake tools 服务） |
 | 6 | 每次切换都追加一行审计（含 mode/applied/deniedCount/savedTokens） | 单测覆盖（临时目录） |
 
-测量工具：`_tmp_review/tools_weight*.py`（从会话日志 `request/header` 复算工具面体量与族构成）。
+测量工具：`scripts/face-weight.py`（本仓库自带，从会话日志 `request/header` 复算工具面体量、从 `tool/call` 复算族级使用频率，口径同宿主 `estimate.ts`）。
 
 ## 8 · 与实现的关系
 
@@ -113,7 +115,10 @@
 
 | 日期 | 修订 | 触发 |
 |------|------|------|
-| 2026-09-13 | 初稿 + 实现 | 任务 `t-b3fc4d7e`；测量发现「工具面 30,519 tok、其中 63 个零调用工具占 25%」，据此确定 lean 档 deny 集 |
+| 2026-09-13 | 初稿 + 实现 | 任务 `t-b3fc4d7e`；测量发现「工具面 30,519 tok、其中 67 个极少调用工具占 25%」，据此确定 lean 档 deny 集 |
+| 2026-09-13 | **① 报告口径被实践修正** | 首次上线后 `status` 报「收窄 67/240」，而请求头实测本会话只有 208 个工具——差异 32 个。根因：preset 作用域的 `schemas()` 返回的是**全局视图**（含其他预设挂载的工具），不是本会话可见集。修法：字段改名 `totalTools → globalTools` 并在文档/README 明确标注「全局面」，本会话可见数一律以请求头实测为准（v0.1.1） |
+| 2026-09-13 | ② 验收 1/2 转为**已线上验证** | 重启后实测 274 → 208、full → 275，两条一次性测量的判据均落地 |
+| 2026-09-13 | ③ 挂载点判据被宿主源码确认 | `tools.restrict()` 源码明确拒绝无作用域调用（"a context-global restriction would mask every agent"）——印证「挂 preset 而非 host 组合」是唯一正确落点 |
 
 ## 10 · 未决问题
 

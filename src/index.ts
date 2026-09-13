@@ -73,7 +73,7 @@ export function apply(ctx: Context, config: Config): void {
           mode,
           applied,
           deniedCount: denied.length,
-          totalTools: tools.schemas().length,
+          globalTools: tools.schemas().length,
           savedTokens: cost.tokens,
           unmatched,
           ...(reason === undefined ? {} : { reason }),
@@ -123,7 +123,8 @@ export function apply(ctx: Context, config: Config): void {
 
     const cost = faceCost(tools.schemas(), denied)
     logger.info(
-      `工具面档位 ${mode}：收窄 ${denied.length} 项，applied=${applied}，省约 ${cost.tokens} tok`,
+      `工具面档位 ${mode}：收窄 ${denied.length} 项（全局面 ${tools.schemas().length} 个工具），`
+      + `applied=${applied}，省约 ${cost.tokens} tok`,
     )
     void writeAudit(action)
   }
@@ -163,7 +164,7 @@ export function apply(ctx: Context, config: Config): void {
           mode: { type: 'string', required: true },
           applied: { type: 'boolean', required: true },
           deniedCount: { type: 'number', required: true },
-          totalTools: { type: 'number', required: true },
+          globalTools: { type: 'number', required: true },
           savedChars: { type: 'number', required: true },
           savedTokens: { type: 'number', required: true },
           unmatched: { type: 'array', items: { type: 'string' }, required: true },
@@ -175,19 +176,19 @@ export function apply(ctx: Context, config: Config): void {
           mode?: string
           applied?: boolean
           deniedCount?: number
-          totalTools?: number
+          globalTools?: number
           savedChars?: number
           savedTokens?: number
           unmatched?: string[]
           reason?: string
         }
-        const total = r.totalTools ?? 0
+        const total = r.globalTools ?? 0
         const lines: string[] = []
         if (r.mode === 'full') {
-          lines.push(`工具面 [full] 全量 ${total} 个工具可见`)
+          lines.push(`工具面 [full] 全局面 ${total} 个工具可见（收窄已解除）`)
         } else {
           lines.push(
-            `工具面 [lean] 收窄 ${r.deniedCount ?? 0}/${total} 个工具，`
+            `工具面 [lean] 收窄 ${r.deniedCount ?? 0} 个工具（全局面 ${total} 个），`
             + `省约 ${r.savedTokens ?? 0} tok（${r.savedChars ?? 0} 字符）`,
           )
           if (r.applied === false) lines.push(`· 收窄未生效：${r.reason ?? '未知原因'}`)
@@ -213,7 +214,7 @@ export function apply(ctx: Context, config: Config): void {
           mode,
           applied,
           deniedCount: denied.length,
-          totalTools: tools.schemas().length,
+          globalTools: tools.schemas().length,
           savedChars: 0,
           savedTokens: 0,
           unmatched,
@@ -228,7 +229,7 @@ export function apply(ctx: Context, config: Config): void {
         mode,
         applied,
         deniedCount: denied.length,
-        totalTools: schemas.length,
+        globalTools: schemas.length,
         savedChars: cost.chars,
         savedTokens: cost.tokens,
         unmatched,
