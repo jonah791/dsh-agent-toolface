@@ -59,6 +59,10 @@
 - `savedTokens` 是按宿主口径（4 字符/token）估算的单工具之和，与整份 header 计价存在数个百分点差异。
 - 语义文档（判据/不变量/验收）见 `docs/semantic.md`。
 
+## 相关
+
+- [我的数字生命爱丽丝 — 插件生态中心（架构总览）](https://github.com/jonah791/alice-digital-life)
+
 ## License
 
 MIT

@@ -14,6 +14,8 @@
   python3 scripts/face-weight.py --session 879c4ae1
 
 依赖：zstandard（WSL: pip install zstandard）。
+会话日志根目录用 `DSH_SESSION_DIR` 指定，缺省 `~/.dsh/sessions`
+（本项目实测环境：`DSH_SESSION_DIR=/mnt/e/alice/.dsh/sessions`）。
 """
 import argparse
 import collections
@@ -25,7 +27,7 @@ import time
 
 import zstandard as zstd
 
-BASE = os.environ.get('DSH_SESSION_DIR', '/mnt/e/alice/.dsh/sessions')
+BASE = os.environ.get('DSH_SESSION_DIR', os.path.join(os.path.expanduser('~'), '.dsh', 'sessions'))
 
 
 def jlen(value) -> int:
