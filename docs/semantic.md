@@ -6,7 +6,7 @@
 |------|-----|
 | 能力名 | `dsh-agent-toolface`（工具面分档） |
 | 主副本 | 本文件（`self-plugins/dsh-agent-toolface/docs/semantic.md`） |
-| 状态 | implemented（线上未验收，见 §7） |
+| 状态 | verified（6/6 验收：4 条单测已实测 + 2 条线上实测，见 §7） |
 | 载体 | 插件（agent preset 行）；工具 `toolface` |
 | 作者/日期 | 爱丽丝 · 2026-09-13 |
 | 相关 | 规则 §5.20；任务 `t-b3fc4d7e`；宿主契约 `packages/core/tools` 的 `restrict` / `schemas` |
@@ -91,12 +91,12 @@
 
 | # | 验收（一次测量可判真假） | 状态 |
 |---|--------------------------|------|
-| 1 | 加载后模型可见工具数从 274 降到 ≤211，可由会话日志 `request/header` 实测 | **已线上验证**（2026-09-13 08:55 重启后：274 → **208** = 274 − 67 + 1 个 toolface；122,076 → 91,682 字符 ≈ 30,519 → 22,925 tok） |
-| 2 | `toolface action=full` 后重新请求的工具数为 274 + 1 | **已线上验证**（同日 08:56：**275** 个 / 122,579 字符 ≈ 30,649 tok），随后已切回 lean |
-| 3 | 未命中模式（配置含 `zzz_*`）不导致插件加载失败，且出现在 `status.unmatched` | 单测覆盖 |
-| 4 | deny 为空时**不调用** `restrict`（避免宿主 `restrict({})` 抛错） | 单测覆盖 |
-| 5 | `restrict` 抛错时插件仍加载，`status.applied=false` 且 `reason` 非空 | 单测覆盖（fake tools 服务） |
-| 6 | 每次切换都追加一行审计（含 mode/applied/deniedCount/savedTokens） | 单测覆盖（临时目录） |
+| 1 | 加载后模型可见工具数从 274 降到 ≤211，可由会话日志 `request/header` 实测 | ✅ 已实测（2026-09-13 08:55 重启后：274 → **208** = 274 − 67 + 1 个 toolface；122,076 → 91,682 字符 ≈ 30,519 → 22,925 tok） |
+| 2 | `toolface action=full` 后重新请求的工具数为 274 + 1 | ✅ 已实测（同日 08:56：**275** 个 / 122,579 字符 ≈ 30,649 tok），随后已切回 lean |
+| 3 | 未命中模式（配置含 `zzz_*`）不导致插件加载失败，且出现在 `status.unmatched` | ✔ 已实测（`tests/apply.test.mjs` 装载路径 7 项之一：fake ctx 断言未命中不进入 deny） |
+| 4 | deny 为空时**不调用** `restrict`（避免宿主 `restrict({})` 抛错） | ✔ 已实测（`tests/apply.test.mjs`：full 档与全未命中两种情形断言 `restrictCalls.length === 0`） |
+| 5 | `restrict` 抛错时插件仍加载，`status.applied=false` 且 `reason` 非空 | ✔ 已实测（`tests/apply.test.mjs`：注入 fake tools 使 restrict 抛错，断言工具仍注册 + 错误落 logger） |
+| 6 | 每次切换都追加一行审计（含 mode/applied/deniedCount/savedTokens） | ✔ 已实测（单测写临时目录回读；线上 `.dsh/toolface-events.log` 已有 load/full/lean 三行真实记录） |
 
 测量工具：`scripts/face-weight.py`（本仓库自带，从会话日志 `request/header` 复算工具面体量、从 `tool/call` 复算族级使用频率，口径同宿主 `estimate.ts`）。
 
