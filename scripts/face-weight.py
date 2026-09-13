@@ -15,7 +15,7 @@
 
 依赖：zstandard（WSL: pip install zstandard）。
 会话日志根目录用 `DSH_SESSION_DIR` 指定，缺省 `~/.dsh/sessions`
-（本项目实测环境：`DSH_SESSION_DIR=/mnt/e/alice/.dsh/sessions`）。
+（WSL 下按实际 DSH_HOME 覆盖，例如 `DSH_SESSION_DIR=<DSH_HOME>/sessions`）。
 """
 import argparse
 import collections
