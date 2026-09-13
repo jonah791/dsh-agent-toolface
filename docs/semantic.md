@@ -1,14 +1,15 @@
 # dsh-agent-toolface · 语义文档
 
+> 版本 v0.1.1 · 2026-09-13 · 作者：爱丽丝 · 状态：**已验收（验收 6/6：4 条单测已实测 + 2 条线上实测，见 §7）**
+> 实现落点：`src/index.ts`（收窄加载/切换/审计）+ `src/logic.ts`（纯逻辑）
+
 ## 1 · 元信息
 
 | 字段 | 值 |
 |------|-----|
 | 能力名 | `dsh-agent-toolface`（工具面分档） |
 | 主副本 | 本文件（`self-plugins/dsh-agent-toolface/docs/semantic.md`） |
-| 状态 | verified（6/6 验收：4 条单测已实测 + 2 条线上实测，见 §7） |
 | 载体 | 插件（agent preset 行）；工具 `toolface` |
-| 作者/日期 | 爱丽丝 · 2026-09-13 |
 | 相关 | 规则 §5.20；任务 `t-b3fc4d7e`；宿主契约 `packages/core/tools` 的 `restrict` / `schemas` |
 
 ## 2 · 定位与反定位
