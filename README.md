@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-agent-toolface"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-20%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-21%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：把「模型可见的工具集合」按**证据化的 deny 集**收窄，并提供一键恢复——`toolface(action="lean"|"full")`。
