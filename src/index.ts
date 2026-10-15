@@ -60,11 +60,20 @@ export function apply(ctx: Context, config: Config): void {
   let reason: string | undefined
   let unmatched: string[] = []
   let denied: string[] = []
+  /** 上一行审计的关键字段指纹（除时间戳外）——同状态不重复落盘。 */
+  let lastAuditKey = ''
 
-  const writeAudit = async (action: string): Promise<void> => {
+  const writeAudit = async (action: string, face: ToolSchemaLike[]): Promise<void> => {
     try {
+      const cost = faceCost(face, denied)
+      // 2026-10-03 修复日志爆量：审计关心的是**状态变化**，不是心跳。
+      // 实测自激期间该文件涨到 2,311,441 行 / 439 MB（每 ~275 ms 一行，内容完全相同）。
+      // 故按「除时间戳外的全部字段」去重——同状态不重复落盘。
+      const key = [action, mode, applied, denied.length, face.length, cost.tokens,
+        unmatched.join(',')].join('|')
+      if (key === lastAuditKey) return
+      lastAuditKey = key
       await mkdir(dshHome, { recursive: true })
-      const cost = faceCost(tools.schemas(), denied)
       await appendFile(
         auditPath,
         auditLine({
@@ -73,7 +82,7 @@ export function apply(ctx: Context, config: Config): void {
           mode,
           applied,
           deniedCount: denied.length,
-          globalTools: tools.schemas().length,
+          globalTools: face.length,
           savedTokens: cost.tokens,
           unmatched,
           ...(reason === undefined ? {} : { reason }),
@@ -86,7 +95,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /** 先撤销已有收窄，再按目标档位重挂（I2 幂等）。 */
-  const applyMode = (next: ToolfaceMode, override: readonly string[] | undefined, action: string): void => {
+  const applyMode = (next: ToolfaceMode, override: readonly string[] | undefined, action: string): ToolSchemaLike[] => {
     mode = next
     unmatched = []
     denied = []
@@ -102,9 +111,15 @@ export function apply(ctx: Context, config: Config): void {
       lift = undefined
     }
 
+    // 宿主 `tools.schemas()` 每次调用都要对**每个**工具深克隆 parameters
+    // （tools.schemaOf → values.snapshotJsonValue，实测 274 工具 ≈ 8s/次，2026-09-26 CPU 剖面）。
+    // 因此整个 applyMode 只取**一份**快照，下面全部复用它——这曾在启动路径上被调 5 次，
+    // 单次 apply 就烧掉约 40s（冷启 60s 的主因，任务 t-bec5b8b7）。
+    const face = tools.schemas()
+
     const patterns = denyFor(mode, config.deny, override)
     if (patterns.length > 0) {
-      const plan = expandPatterns(patterns, tools.schemas().map(s => s.name))
+      const plan = expandPatterns(patterns, face.map(s => s.name))
       unmatched = plan.unmatched
       denied = plan.matched
       if (plan.matched.length > 0) {
@@ -121,20 +136,47 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
 
-    const cost = faceCost(tools.schemas(), denied)
+    const cost = faceCost(face, denied)
     logger.info(
-      `工具面档位 ${mode}：收窄 ${denied.length} 项（全局面 ${tools.schemas().length} 个工具），`
+      `工具面档位 ${mode}：收窄 ${denied.length} 项（全局面 ${face.length} 个工具），`
       + `applied=${applied}，省约 ${cost.tokens} tok`,
     )
-    void writeAudit(action)
+    void writeAudit(action, face)
+    return face
   }
 
   applyMode(mode, undefined, 'load')
 
-  // 补挂：仅当仍有未命中的模式（工具提供方后注册/热挂载时才会发生）。
+  // 补挂：仅当未命中的模式**变少**（说明确有新工具注册进来）时才重试，且次数封顶。
+  //
+  // ⚠ 2026-10-03 修复自激循环。实测症状：web 进程 34% 单核持续占用（15 秒烧 5.13 CPU 秒）、
+  //   审计日志涨到 2,311,441 行 / 439 MB、工具调用后主模型请求长时间无响应（主人从轨迹上看到
+  //   「命令 263 ms 完成，之后近 1 分钟没有进入思考状态」）。
+  //   根因：原守卫 `unmatched.length === 0` 在本机**恒不成立** —— 配置里的
+  //   `sec_*/red_*/blue_*/otw_*/xp_*` 五个模式永远匹配不到工具，unmatched 恒为 5 项。
+  //   于是每次 tools/change 都安排 reapply，而 reapply 内的 `lift()/restrict()` 又触发
+  //   tools/change ⇒ 每 ~275 ms 自激一轮，每轮一次全量 schema 快照
+  //   （宿主对每个工具深克隆 parameters，290 个工具/次，见 applyMode 注释）。
+  //   新判据把「未命中恒定」这一真实语义表达出来：没有新工具注册 ⇒ 重试无意义。
+  // 启动期各插件连续注册工具会连发 tools/change，逐次 applyMode 等于逐次全量 schema 快照
+  // ⇒ 去抖合并成一次（交互式切换走工具入口，不经这里，故不影响响应性）。
+  const MAX_REAPPLY = 5
+  let reapplyTimer: ReturnType<typeof setTimeout> | undefined
+  let reapplyCount = 0
+  let lastUnmatchedCount = unmatched.length
   ctx.on('tools/change', () => {
     if (mode === 'full' || unmatched.length === 0) return
-    applyMode(mode, undefined, 'reapply')
+    if (unmatched.length >= lastUnmatchedCount) return  // 未命中没变少 ⇒ 无新工具 ⇒ 不重试
+    if (reapplyCount >= MAX_REAPPLY) return             // 封顶，防提供方持续抖动
+    if (reapplyTimer !== undefined) clearTimeout(reapplyTimer)
+    reapplyTimer = setTimeout(() => {
+      reapplyTimer = undefined
+      if (mode === 'full' || unmatched.length === 0) return
+      if (unmatched.length >= lastUnmatchedCount) return
+      reapplyCount += 1
+      applyMode(mode, undefined, 'reapply')
+      lastUnmatchedCount = unmatched.length
+    }, 250)
   })
 
   ctx.tools.register(defineTool({
@@ -206,30 +248,34 @@ export function apply(ctx: Context, config: Config): void {
         ? input.deny.filter((v): v is string => typeof v === 'string')
         : undefined
 
+      // 同一请求只取一份 schema 快照（宿主每次调用都对全部工具深克隆，见 applyMode 注释）。
+      let face: ToolSchemaLike[]
       if (action === 'lean' || action === 'full') {
-        applyMode(action, override, action)
+        face = applyMode(action, override, action)
       } else if (action !== 'status') {
+        face = tools.schemas()
         return {
           ok: false,
           mode,
           applied,
           deniedCount: denied.length,
-          globalTools: tools.schemas().length,
+          globalTools: face.length,
           savedChars: 0,
           savedTokens: 0,
           unmatched,
           reason: `未知 action "${action}"：只接受 status / lean / full`,
         }
+      } else {
+        face = tools.schemas()
       }
 
-      const schemas = tools.schemas()
-      const cost = faceCost(schemas, denied)
+      const cost = faceCost(face, denied)
       return {
         ok: true,
         mode,
         applied,
         deniedCount: denied.length,
-        globalTools: schemas.length,
+        globalTools: face.length,
         savedChars: cost.chars,
         savedTokens: cost.tokens,
         unmatched,

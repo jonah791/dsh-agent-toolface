@@ -33,14 +33,14 @@ function fakeCtx(state) {
       },
       register: def => { state.registered.push(def.name) },
     },
-    on: (evt) => { state.events.push(evt) },
+    on: (evt, cb) => { state.events.push(evt); state.handlers[evt] = cb },
   }
 }
 
 async function freshState() {
   const dir = await mkdtemp(join(tmpdir(), 'toolface-'))
   process.env['DSH_HOME'] = dir
-  return { dir, restrictCalls: [], lifted: [], registered: [], events: [], warns: [], errors: [] }
+  return { dir, restrictCalls: [], lifted: [], registered: [], events: [], handlers: {}, warns: [], errors: [] }
 }
 
 const { apply } = await import('../lib/index.js')
@@ -99,4 +99,22 @@ test('apply：审计行落盘且可回读（含 applied/deniedCount/savedTokens�
   assert.equal(entry.deniedCount, 2)
   assert.equal(entry.globalTools, SCHEMAS.length)
   assert.ok(entry.savedTokens > 0)
+})
+
+// ── 2026-10-03 自激循环回归 ────────────────────────────────────────────────
+// 症状（线上实测）：web 进程 34% 单核持续占用、审计日志 231 万行 / 439 MB、
+// 工具调用后主模型请求长时间无响应。根因＝原守卫 `unmatched.length === 0` 在
+// 「配置里有永不命中的模式」时恒不成立，而 reapply 内的 restrict() 又触发
+// tools/change ⇒ 自激。
+// 本测试锁住新判据：**未命中数没变少 ⇒ 不得重挂**。
+test('apply：unmatched 恒定（无新工具注册）时 tools/change 不重挂 —— 防自激循环', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), { mode: 'lean', deny: ['sec_*', 'zzz_*'] }) // zzz_* 永不命中
+  const before = state.restrictCalls.length
+  const handler = state.handlers['tools/change']
+  assert.equal(typeof handler, 'function', 'tools/change 监听器应已注册')
+  for (let i = 0; i < 5; i += 1) handler()          // 模拟 restrict() 反复触发
+  await new Promise(r => setTimeout(r, 500))        // 越过 250 ms 去抖
+  assert.equal(state.restrictCalls.length, before,
+    'unmatched 未变少时不得重挂（否则自激：每 ~275ms 一次全量 schema 快照）')
 })
