@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { auditLine, denyFor, expandPatterns, faceCost, parseMode } from '../lib/logic.js'
+import { auditLine, denyFor, expandPatterns, faceCost, parseMode, planDomain } from '../lib/logic.js'
 
 const KNOWN = ['sec_hydra', 'sec_nmap', 'red_dir_brute', 'read', 'edit', 'wq_simulate', 'clyan_scan']
 
@@ -110,4 +110,81 @@ test('auditLine：reason 存在时才写入该字段', () => {
   }))
   assert.equal(parsed.reason, '示例原因')
   assert.equal(parsed.mode, 'full')
+})
+
+// ── 按域开启（planDomain） ────────────────────────────────────────────────
+// 域覆盖集 = 所有域工具并集；只有被域覆盖的工具才可能被 deny。
+// 不在任何域里的工具永不被 deny（官方基础工具与新插件自动常驻，fail-safe）。
+
+const DOMAINS = {
+  quant: ['wq_*', 'quant_*'],
+  cleanup: ['clyan_*'],
+  security: ['sec_*'],
+}
+const RESIDENT = ['read', 'edit', 'remember']
+
+test('planDomain：目标域不存在 ⇒ known=false、deny 为空（fail-loud，不许静默当「没东西可开」）', () => {
+  const plan = planDomain(KNOWN, DOMAINS, RESIDENT, 'nope')
+  assert.equal(plan.known, false)
+  assert.deepEqual(plan.deny, [])
+  assert.deepEqual(plan.unmatched, ['nope'])
+})
+
+test('planDomain：只 deny「被域覆盖 ∧ 非常驻 ∧ 非目标域」的工具', () => {
+  const plan = planDomain(KNOWN, DOMAINS, RESIDENT, 'quant')
+  // KNOWN 里被域覆盖：sec_hydra, sec_nmap, wq_simulate, clyan_scan
+  // 目标域 quant ⇒ wq_simulate 保留；其余三个 deny
+  assert.deepEqual(plan.deny, ['clyan_scan', 'sec_hydra', 'sec_nmap'])
+  assert.deepEqual(plan.domainTools, ['wq_simulate'])
+})
+
+test('planDomain：不在任何域里的工具永不被 deny（read/edit 是官方基础工具）', () => {
+  const plan = planDomain(KNOWN, DOMAINS, RESIDENT, 'quant')
+  assert.equal(plan.deny.includes('read'), false)
+  assert.equal(plan.deny.includes('edit'), false)
+  assert.equal(plan.deny.includes('wq_simulate'), false) // 目标域，保留
+})
+
+test('planDomain：常驻模式可覆盖域内工具（常驻优先于域划分）', () => {
+  const plan = planDomain(KNOWN, DOMAINS, ['read', 'wq_*'], 'cleanup')
+  assert.deepEqual(plan.deny, ['sec_hydra', 'sec_nmap'])
+  // 常驻模式解析的是**全部**工具（不限域内）⇒ read（域外）与 wq_simulate（域内）都命中
+  assert.deepEqual(plan.residentTools, ['read', 'wq_simulate'])
+  assert.deepEqual(plan.domainTools, ['clyan_scan'])
+})
+
+test('planDomain：空域表 ⇒ known=false 且零 deny（未配置时零回归）', () => {
+  const plan = planDomain(KNOWN, {}, RESIDENT, 'quant')
+  assert.equal(plan.known, false)
+  assert.deepEqual(plan.deny, [])
+})
+
+test('planDomain：目标域内未命中的模式如实报出（不静默吞掉拼写错误）', () => {
+  const plan = planDomain(KNOWN, { x: ['zzz_*', 'read'] }, [], 'x')
+  assert.deepEqual(plan.unmatched, ['zzz_*'])
+  assert.deepEqual(plan.domainTools, ['read'])
+})
+
+test('planDomain：目标域自身不被 deny（否则「开启」等于没开）', () => {
+  for (const target of Object.keys(DOMAINS)) {
+    const plan = planDomain(KNOWN, DOMAINS, RESIDENT, target)
+    for (const tool of plan.domainTools) {
+      assert.equal(plan.deny.includes(tool), false, `${target} 域工具 ${tool} 不该被 deny`)
+    }
+  }
+})
+
+test('parseMode：domain 是合法档位', () => {
+  assert.equal(parseMode('domain'), 'domain')
+})
+
+test('planDomain：target=undefined ⇒「只常驻」（mode=domain 的默认态，不是错误）', () => {
+  const plan = planDomain(KNOWN, DOMAINS, RESIDENT, undefined)
+  assert.equal(plan.known, true)
+  assert.deepEqual(plan.unmatched, [])
+  assert.deepEqual(plan.domainTools, [])
+  // 只留常驻 read/edit/remember ⇒ 被域覆盖的四个全 deny
+  assert.deepEqual(plan.deny, ['clyan_scan', 'sec_hydra', 'sec_nmap', 'wq_simulate'])
+  // 未归类工具仍不出现
+  assert.equal(plan.deny.includes('read'), false)
 })

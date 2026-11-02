@@ -31,7 +31,9 @@
 | 术语 | 含义 |
 |------|------|
 | 工具面（tool face） | 一次请求里模型可见的工具 schema 集合；宿主口径 `toolsTokens = ceil(len(JSON.stringify(header.tools))/4) + 4` |
-| 档位（mode） | `lean` = 按 deny 收窄；`full` = 全量可见 |
+| 档位（mode） | `lean` = 按 deny 收窄；`full` = 全量可见；**`domain` = 只留常驻集 + 指定域**（2026-10-31 新增，主人定调「按需开启，只有少数插件常驻」） |
+| 域（domain） | 域 id → 一组工具模式；**域 id 对齐技能 id**。`toolface(action="domain", name=X)` 只开该域 |
+| 常驻集（resident） | 任何域下都可见的工具模式。判据两条：① 不带它无法**工作** ② 不带它无法**恢复**（重启链路 `preflight_*`/`daemon_*` 属后者，2026-10-31 实测踩过死锁） |
 | deny 模式（pattern） | 精确工具名，或尾随 `*` 的前缀（如 `sec_*`） |
 | 命中/未命中 | 模式是否解析到当前已注册的全局工具名；未命中不得静默丢弃 |
 | 收窄（restrict） | 宿主 `ctx.tools.restrict({deny})` —— 在调用者作用域内掩蔽这些工具；多个 restriction **取交集** |
@@ -41,13 +43,17 @@
 模型：**预设配置的默认档** → 加载时解析 → 作用域内 restriction → 运行期由 `toolface` 切换（先撤销、再按新档重挂）。
 
 - **I1 作用域**：收窄只能发生在有作用域的 ctx；全局收窄被宿主拒绝，本插件也不尝试。收窄失败必须响亮落盘（fail-soft 但不静默）。
-- **I2 幂等**：切换前一律先撤销已有 restriction；`lean` 重复调用不叠加，`full` 重复调用不新增 effect。
+- **I2 幂等**：切换前一律先撤销已有 restriction；`lean`/`domain` 重复调用不叠加，`full` 重复调用不新增 effect。
 - **I3 未命中不静默**：模式未解析到任何工具时记入 `unmatched` 并写审计，且不调用 `restrict`（宿主对未知工具名抛错）。
 - **I4 审计**：每次「加载 / 切换 / 补挂」都追加一行 JSON 到 `${DSH_HOME}/toolface-events.log`（时间、动作、档位、生效与否、收窄数、总量、省下 token、未命中、原因）。
 - **I5 不持久化放宽**：档位是会话运行期状态；**重启回到预设配置的默认档**（放宽不会被写进磁盘，避免一次临时放开变成长期默认）。
 - **I6 报告如实**：`status` 报告的是**实测**（当前 `tools.schemas()` 的数量与体量），不是配置意图。
 - **I7 补挂幂等收敛（不可自激）**：补挂重解析的触发条件必须**可满足且会收敛**——判据是「未命中数相比上次**变少**」（确有新工具被解析到），且总次数封顶。⚠ 反例（2026-10-03 事故，见 §9 ④）：原判据「存在未命中模式」在配置含**永不命中**的模式时恒为真，而补挂内的 `restrict()/lift()` 又触发 `tools/change` ⇒ 每 ~275 ms 自激一轮。
 - **I8 审计体量有界**：审计按**状态变化**去重（除时间戳外的关键字段一致则不落盘）——审计记录的是状态变迁，不是心跳。⚠ 反例（同事故）：原「每次加载/切换/补挂都追加一行」在自激下写出 231 万行 / 439 MB。
+- **I9 域的三条不变量**（`mode=domain`，2026-10-31 新增）：
+  - **① 常驻集必含「恢复链路」**：`resident` 的判据有两条——不带它无法**工作**，或不带它无法**恢复**。后者极易漏：`preflight_*`/`daemon_*` 曾只放在 `plugin-admin` 域里 ⇒ 「仅常驻」档下预检→重启闭环直接断掉（实测 `unknown tool`），而切域的结果又会被重启重置 ⇒ 死锁。补进 resident 后收窄数 266→264（正好少 deny 这 2 个）。
+  - **② 域 id 对齐技能 id**：一个域 = 一组「只在做那一类活时才需要」的工具。
+  - **③ 域外工具永不被 deny**（fail-safe）：不在任何域里的工具（官方基础工具、尚未归类的新插件）自动常驻。**失败方向是「多可见」而不是「突然消失」**——想 deny 就必须显式归类，归错也只影响那一族。判据实现在 `planDomain`：`deny = coveredTools().filter(n => !keep.has(n))`，`keep = resident ∪ 目标域`，`covered` 只含被某个域显式覆盖的工具。
 
 ## 5 · 契约（含调用点清单）
 
@@ -57,18 +63,29 @@
 - id: toolface
   name: dsh-agent-toolface
   config:
-    mode: lean          # lean | full（其他值加载即抛错，fail-loud）
-    deny: ['sec_*', ...]  # 精确名或尾随 * 前缀
+    mode: domain        # lean | full | domain（其他值加载即抛错，fail-loud）
+    deny: ['sec_*', ...]  # lean 档用：精确名或尾随 * 前缀（domain 档下被忽略，保留便于一行回退）
+    domains:              # domain 档用：域 id → 工具模式（域 id 对齐技能 id）
+      quant-research: ['wq_*', 'quant_*']
+      media-generation: ['comfy_*', 'reze_*', 'video_*', 'anima_*']
+      evidence-retrieval: ['search_*', 'fetch_*', 'archive_*']
+    resident:             # domain 档用：任何域下都可见（跨域通用 + **恢复链路**，见 I9 ①）
+      - 'remember'
+      - 'toolface'
+      - 'tool_find'
+      - 'preflight_*'     # 恢复链路：没有它连预检都做不了
+      - 'daemon_*'        # 恢复链路：没有它连重启都做不了
 ```
 
 **工具 `toolface`**
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `action` | string（必填） | `status` 查看 / `lean` 收窄 / `full` 全量 |
+| `action` | string（必填） | `status` 查看 / `lean` 收窄 / `full` 全量 / **`domain` 按域开启** |
 | `deny` | string[] | 可选，`lean` 时覆盖配置的 deny 模式（本次会话内有效） |
+| `name` | string | 可选，`domain` 时指定要开启的域 id；**省略 = 只留常驻集**（这是 `mode=domain` 的默认态，不是错误态） |
 
-返回：`{ ok, mode, applied, deniedCount, globalTools, savedChars, savedTokens, unmatched[], reason? }`。
+返回：`{ ok, mode, domain?, domains[], applied, deniedCount, globalTools, savedChars, savedTokens, unmatched[], reason? }`。
 
 `globalTools` 是**全局面**计数（preset 作用域的 `schemas()` 是全局视图）；**本会话模型可见数**由请求头实测，不由本工具报告（见 §9 实践修订 ①）。
 

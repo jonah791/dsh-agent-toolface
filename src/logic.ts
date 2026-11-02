@@ -12,8 +12,8 @@ export interface ToolSchemaLike {
   parameters?: unknown
 }
 
-/** 档位：lean = 按 deny 收窄；full = 全量可见。 */
-export type ToolfaceMode = 'lean' | 'full'
+/** 档位：lean = 按 deny 收窄；full = 全量可见；domain = 按域（只留常驻 + 当前域）。 */
+export type ToolfaceMode = 'lean' | 'full' | 'domain'
 
 /** 模式列表解析结果：命中的工具名 + 未命中的模式明文。 */
 export interface PatternPlan {
@@ -77,14 +77,15 @@ export function faceCost(schemas: readonly ToolSchemaLike[], names: Iterable<str
 }
 
 /**
- * 决定本次应下发的 deny 模式列表。
- * @param mode - 目标档位。
+ * 决定本次应下发的 deny 模式列表（**只服务 lean / full 两档**）。
+ * @param mode - 目标档位；`domain` 档不经过本函数（它由 `planDomain` 决定），
+ *   故签名收窄为 `'lean' | 'full'`——调用方必须先分支，漏分支会被类型检查拦下。
  * @param configDeny - 配置里的 deny 模式。
  * @param override - 调用方本次覆盖的模式（缺省用配置）。
  * @returns full 一律空列表（撤销全部收窄）；lean 返回覆盖或配置的模式。
  */
 export function denyFor(
-  mode: ToolfaceMode,
+  mode: 'lean' | 'full',
   configDeny: readonly string[],
   override: readonly string[] | undefined,
 ): string[] {
@@ -98,7 +99,80 @@ export function denyFor(
  * @returns 合法档位，或 undefined（调用方须 fail-loud 或回退）。
  */
 export function parseMode(value: unknown): ToolfaceMode | undefined {
-  return value === 'lean' || value === 'full' ? value : undefined
+  return value === 'lean' || value === 'full' || value === 'domain' ? value : undefined
+}
+
+/** 域定义：域 id → 工具模式（语法与 deny 相同：精确名，或尾随 `*` 的前缀）。 */
+export type DomainMap = Readonly<Record<string, readonly string[]>>
+
+/** 一次「按域开启」的解析结果。 */
+export interface DomainPlan {
+  /** 本次要 deny 的工具名（升序去重）。 */
+  deny: string[]
+  /** 目标域解析出的工具名（升序）。 */
+  domainTools: string[]
+  /** 常驻集解析出的工具名（升序）。 */
+  residentTools: string[]
+  /** 目标域里未命中已知工具的模式明文。 */
+  unmatched: string[]
+  /** 目标域是否存在——false 时调用方须 fail-loud，不许静默当「没东西可开」。 */
+  known: boolean
+}
+
+/**
+ * 按域解析 deny：**只 deny「被某个域覆盖」的工具中，既非常驻、也不属目标域的那部分**。
+ *
+ * 关键设计（为什么不是「全部工具减去 keep」）：不在任何域里的工具**永不被 deny**——
+ * 官方基础工具（read/write/bash/grep…）与尚未归类的新插件因此自动常驻。
+ * 这让「漏归类」的失败方向是**多可见**而不是**看不见**（fail-safe：宁可多占上下文，
+ * 不可让 agent 在需要时发现工具消失）。想 deny 就必须显式归类，归错也只影响那一族。
+ *
+ * @param allTools - 当前已注册的全局工具名（唯一真源：宿主 `tools.schemas()`）。
+ * @param domains - 域定义表。
+ * @param resident - 常驻模式（跨域通用，任何域下都可见）。
+ * @param target - 目标域 id。
+ * @returns deny 计划；`known=false` 表示该域不存在。
+ */
+export function planDomain(
+  allTools: readonly string[],
+  domains: DomainMap,
+  resident: readonly string[],
+  target: string | undefined,
+): DomainPlan {
+  const names = [...allTools]
+  const residentTools = expandPatterns(resident, names).matched
+
+  // 域覆盖集 = 所有域的工具并集。只有这些工具才可能被 deny。
+  const coveredTools = (): string[] => {
+    const covered = new Set<string>()
+    for (const list of Object.values(domains)) {
+      for (const hit of expandPatterns(list, names).matched) covered.add(hit)
+    }
+    return [...covered].sort()
+  }
+
+  // target === undefined ⇒「只常驻」：不额外开任何域。
+  // 这不是错误态（它是 mode=domain 的默认状态），故 known=true、unmatched 为空。
+  if (target === undefined) {
+    const keep = new Set(residentTools)
+    return {
+      deny: coveredTools().filter(n => !keep.has(n)),
+      domainTools: [],
+      residentTools,
+      unmatched: [],
+      known: true,
+    }
+  }
+
+  const patterns = domains[target]
+  if (patterns === undefined) {
+    return { deny: [], domainTools: [], residentTools, unmatched: [target], known: false }
+  }
+  const targetPlan = expandPatterns(patterns, names)
+
+  const keep = new Set<string>([...residentTools, ...targetPlan.matched])
+  const deny = coveredTools().filter(n => !keep.has(n))
+  return { deny, domainTools: targetPlan.matched, residentTools, unmatched: targetPlan.unmatched, known: true }
 }
 
 /** 审计行入参。 */

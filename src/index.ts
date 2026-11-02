@@ -15,7 +15,7 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { appendFile, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
-import { auditLine, denyFor, expandPatterns, faceCost, parseMode } from './logic.ts'
+import { auditLine, denyFor, expandPatterns, faceCost, parseMode, planDomain } from './logic.ts'
 import type { ToolSchemaLike, ToolfaceMode } from './logic.ts'
 
 export const name = 'agent-toolface'
@@ -24,15 +24,21 @@ export const name = 'agent-toolface'
 export const inject = ['tools'] as const
 
 export interface Config {
-  /** 默认档位：lean = 按 deny 收窄；full = 全量可见（非法值加载即抛错）。 */
+  /** 默认档位：lean = 按 deny 收窄；full = 全量可见；domain = 只留常驻 + 当前域。 */
   mode: string
   /** lean 档的 deny 模式：精确工具名或尾随 `*` 的前缀。 */
   deny: string[]
+  /** 域定义：域 id → 工具模式（语法同 deny）。`mode=domain` 时生效。 */
+  domains: Record<string, string[]>
+  /** 常驻模式：任何域下都可见（跨域通用工具）。`mode=domain` 时生效。 */
+  resident: string[]
 }
 
 export const Config = z.object({
   mode: z.string().default('lean'),
   deny: z.array(z.string()).default([]),
+  domains: z.dict(z.array(z.string())).default({}),
+  resident: z.array(z.string()).default([]),
 })
 
 interface ToolsLike {
@@ -60,6 +66,8 @@ export function apply(ctx: Context, config: Config): void {
   let reason: string | undefined
   let unmatched: string[] = []
   let denied: string[] = []
+  /** 当前开启的域（undefined = 只常驻）。仅在 mode=domain 时有意义。 */
+  let currentDomain: string | undefined
   /** 上一行审计的关键字段指纹（除时间戳外）——同状态不重复落盘。 */
   let lastAuditKey = ''
 
@@ -95,7 +103,12 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /** 先撤销已有收窄，再按目标档位重挂（I2 幂等）。 */
-  const applyMode = (next: ToolfaceMode, override: readonly string[] | undefined, action: string): ToolSchemaLike[] => {
+  const applyMode = (
+    next: ToolfaceMode,
+    override: readonly string[] | undefined,
+    action: string,
+    domainTarget?: string | undefined,
+  ): ToolSchemaLike[] => {
     mode = next
     unmatched = []
     denied = []
@@ -116,29 +129,49 @@ export function apply(ctx: Context, config: Config): void {
     // 因此整个 applyMode 只取**一份**快照，下面全部复用它——这曾在启动路径上被调 5 次，
     // 单次 apply 就烧掉约 40s（冷启 60s 的主因，任务 t-bec5b8b7）。
     const face = tools.schemas()
+    const allNames = face.map(s => s.name)
 
-    const patterns = denyFor(mode, config.deny, override)
-    if (patterns.length > 0) {
-      const plan = expandPatterns(patterns, face.map(s => s.name))
+    if (mode === 'domain') {
+      // 按域：只 deny「被域覆盖 ∧ 非常驻 ∧ 非目标域」的工具。
+      // 不在任何域里的工具永不被 deny ⇒ 官方基础工具与未归类插件自动常驻（fail-safe）。
+      currentDomain = domainTarget
+      const plan = planDomain(allNames, config.domains, config.resident, domainTarget)
       unmatched = plan.unmatched
-      denied = plan.matched
-      if (plan.matched.length > 0) {
-        try {
-          lift = tools.restrict({ deny: plan.matched })
-          applied = true
-        } catch (err) {
-          reason = (err as Error).message
-          logger.error(`工具面收窄失败（本会话保持全量可见）: ${reason}`)
-        }
+      if (!plan.known) {
+        const known = Object.keys(config.domains).sort().join(', ')
+        reason = `未知域 ${JSON.stringify(domainTarget)}；已配置域：${known === '' ? '（无）' : known}`
+        logger.warn(`工具面按域跳过：${reason}`)
       } else {
-        reason = 'deny 模式全部未命中已知工具'
-        logger.warn(`工具面收窄跳过：${reason}（未命中 ${unmatched.join(', ')}）`)
+        denied = plan.deny
+      }
+    } else {
+      currentDomain = undefined
+      const patterns = denyFor(mode, config.deny, override)
+      if (patterns.length > 0) {
+        const plan = expandPatterns(patterns, allNames)
+        unmatched = plan.unmatched
+        denied = plan.matched
+        if (plan.matched.length === 0) {
+          reason = 'deny 模式全部未命中已知工具'
+          logger.warn(`工具面收窄跳过：${reason}（未命中 ${unmatched.join(', ')}）`)
+        }
+      }
+    }
+
+    if (denied.length > 0) {
+      try {
+        lift = tools.restrict({ deny: denied })
+        applied = true
+      } catch (err) {
+        reason = (err as Error).message
+        logger.error(`工具面收窄失败（本会话保持全量可见）: ${reason}`)
       }
     }
 
     const cost = faceCost(face, denied)
     logger.info(
-      `工具面档位 ${mode}：收窄 ${denied.length} 项（全局面 ${face.length} 个工具），`
+      `工具面档位 ${mode}${currentDomain === undefined ? '' : `(${currentDomain})`}：`
+      + `收窄 ${denied.length} 项（全局面 ${face.length} 个工具），`
       + `applied=${applied}，省约 ${cost.tokens} tok`,
     )
     void writeAudit(action, face)
@@ -174,7 +207,7 @@ export function apply(ctx: Context, config: Config): void {
       if (mode === 'full' || unmatched.length === 0) return
       if (unmatched.length >= lastUnmatchedCount) return
       reapplyCount += 1
-      applyMode(mode, undefined, 'reapply')
+      applyMode(mode, undefined, 'reapply', currentDomain)
       lastUnmatchedCount = unmatched.length
     }, 250)
   })
@@ -182,19 +215,25 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(defineTool({
     name: 'toolface',
     description:
-      '工具面分档：查看或切换本会话可见工具的收窄档位（lean=按 deny 收窄，full=全量可见）。'
+      '工具面分档：查看或切换本会话可见工具的收窄档位。'
+      + 'lean=按 deny 列表收窄；full=全量可见；domain=按域（只留常驻集 + 指定域，不指定则只留常驻）。'
       + '收窄只作用于本会话（agent 作用域），不影响其他会话或子代理；档位不持久化，重启回到预设默认。'
-      + '当某个族的工具在当前会话不可见时，先用它恢复，再执行任务。',
+      + '当某个族的工具在当前会话不可见时，先用它恢复（full 或 domain），再执行任务。',
     parameters: {
       action: {
         type: 'string',
         required: true,
-        description: 'status=查看当前档位与省下的体量；lean=按 deny 收窄；full=恢复全量可见',
+        description: 'status=查看当前档位/当前域/可用域与省下的体量；lean=按 deny 列表收窄；'
+          + 'full=恢复全量可见；domain=按域开启（配 name 指定域，不配则只留常驻集）',
       },
       deny: {
         type: 'array',
         items: { type: 'string' },
         description: 'lean 时覆盖配置的 deny 模式（精确工具名或尾随 * 的前缀），仅本次会话有效',
+      },
+      name: {
+        type: 'string',
+        description: 'domain 时指定要开启的域 id（省略=只留常驻集）。可用域见 status 输出的 domains',
       },
     },
     output: {
@@ -204,6 +243,8 @@ export function apply(ctx: Context, config: Config): void {
         properties: {
           ok: { type: 'boolean', required: true },
           mode: { type: 'string', required: true },
+          domain: { type: 'string' },
+          domains: { type: 'array', items: { type: 'string' }, required: true },
           applied: { type: 'boolean', required: true },
           deniedCount: { type: 'number', required: true },
           globalTools: { type: 'number', required: true },
@@ -216,6 +257,8 @@ export function apply(ctx: Context, config: Config): void {
       render: (_args, value) => {
         const r = value as {
           mode?: string
+          domain?: string
+          domains?: string[]
           applied?: boolean
           deniedCount?: number
           globalTools?: number
@@ -229,11 +272,17 @@ export function apply(ctx: Context, config: Config): void {
         if (r.mode === 'full') {
           lines.push(`工具面 [full] 全局面 ${total} 个工具可见（收窄已解除）`)
         } else {
+          const tag = r.mode === 'domain'
+            ? (r.domain === undefined ? 'domain·仅常驻' : `domain:${r.domain}`)
+            : 'lean'
           lines.push(
-            `工具面 [lean] 收窄 ${r.deniedCount ?? 0} 个工具（全局面 ${total} 个），`
+            `工具面 [${tag}] 收窄 ${r.deniedCount ?? 0} 个工具（全局面 ${total} 个），`
             + `省约 ${r.savedTokens ?? 0} tok（${r.savedChars ?? 0} 字符）`,
           )
           if (r.applied === false) lines.push(`· 收窄未生效：${r.reason ?? '未知原因'}`)
+        }
+        if (Array.isArray(r.domains) && r.domains.length > 0) {
+          lines.push(`· 可用域（${r.domains.length}）：${r.domains.join(', ')}`)
         }
         if (Array.isArray(r.unmatched) && r.unmatched.length > 0) {
           lines.push(`· 未匹配模式：${r.unmatched.join(', ')}`)
@@ -242,28 +291,37 @@ export function apply(ctx: Context, config: Config): void {
       },
     },
     async execute(args) {
-      const input = (args ?? {}) as { action?: unknown; deny?: unknown }
+      const input = (args ?? {}) as { action?: unknown; deny?: unknown; name?: unknown }
       const action = typeof input.action === 'string' ? input.action : 'status'
       const override = Array.isArray(input.deny)
         ? input.deny.filter((v): v is string => typeof v === 'string')
         : undefined
+      const domainName = typeof input.name === 'string' && input.name.trim() !== ''
+        ? input.name.trim()
+        : undefined
+      const knownDomains = Object.keys(config.domains).sort()
 
       // 同一请求只取一份 schema 快照（宿主每次调用都对全部工具深克隆，见 applyMode 注释）。
       let face: ToolSchemaLike[]
       if (action === 'lean' || action === 'full') {
         face = applyMode(action, override, action)
+      } else if (action === 'domain') {
+        const auditAction = domainName === undefined ? 'domain' : `domain:${domainName}`
+        face = applyMode('domain', undefined, auditAction, domainName)
       } else if (action !== 'status') {
         face = tools.schemas()
         return {
           ok: false,
           mode,
+          ...(currentDomain === undefined ? {} : { domain: currentDomain }),
+          domains: knownDomains,
           applied,
           deniedCount: denied.length,
           globalTools: face.length,
           savedChars: 0,
           savedTokens: 0,
           unmatched,
-          reason: `未知 action "${action}"：只接受 status / lean / full`,
+          reason: `未知 action "${action}"：只接受 status / lean / full / domain`,
         }
       } else {
         face = tools.schemas()
@@ -273,6 +331,8 @@ export function apply(ctx: Context, config: Config): void {
       return {
         ok: true,
         mode,
+        ...(currentDomain === undefined ? {} : { domain: currentDomain }),
+        domains: knownDomains,
         applied,
         deniedCount: denied.length,
         globalTools: face.length,
