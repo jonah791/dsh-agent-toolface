@@ -11,13 +11,13 @@
 # dsh-agent-toolface
 
 <p align="center">
-  <a href="https://github.com/jonah791/dsh-agent-toolface"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
+  <a href="https://github.com/jonah791/dsh-agent-toolface"><img src="https://img.shields.io/badge/version-0.3.0-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-30%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-52%20passed-brightgreen" alt="tests">
 </p>
 
-**一句话**：把「模型可见的工具集合」按**证据化的 deny 集**收窄，并提供一键恢复——`toolface(action="lean"|"full")`。
+**一句话**：决定「一场会话的模型能看到哪些工具」——`lean` 按 deny 集收窄、`domain` 按技能域开启（`open` 累加 / `close` 移除）、`full` 一键全量恢复，并**报出每一档的代价**（每域工具数与 token、域外地板）。
 
 **为什么值得用**：一次请求的工具 schema 是**固定上下文成本**——压缩回收不掉，且工具越多、选择越被稀释。实测（2026-09-13，本机）：
 
@@ -33,14 +33,30 @@
 
 | 工具 | 用途 |
 |------|------|
-| `toolface` | 工具面分档：查看或切换本会话可见工具的收窄档位（`lean`=按 deny 收窄，`full`=全量可见）。收窄只作用于本会话（agent 作用域），不影响其他会话或子代理；档位不持久化，重启回到预设默认。返回 `{ ok, mode, applied, deniedCount, globalTools, savedChars, savedTokens, unmatched[], reason? }` |
+| `toolface` | 工具面分档：查看或切换本会话可见工具的收窄档位。`lean`=按 deny 收窄；`domain`=按技能域开启（**替换**语义）；`open`=**累加**开启；`close`=关闭指定域；`full`=全量恢复。收窄只作用于本会话（agent 作用域），不影响其他会话或子代理；档位不持久化，重启回到预设默认。返回 `{ ok, mode, domain?, openDomains[], domains[], domainCosts?, outside?, applied, deniedCount, globalTools, savedChars, savedTokens, unmatched[], reason? }` |
 
 | 参数 | 说明 |
 |------|------|
-| `action` | `status`=查看当前档位与省下的体量；`lean`=按 deny 收窄；`full`=恢复全量可见 |
+| `action` | `status`=查看档位 / 已开域 / 各域成本 / 域外地板；`lean`=按 deny 收窄；`domain`=替换为给定域（不给 `name` 则只留常驻集）；`open`=累加开启（保留已开域）；`close`=关闭给定域（不给 `name` 则全部关闭）；`full`=恢复全量可见 |
 | `deny` | 可选，`lean` 时覆盖配置的 deny 模式（精确工具名或尾随 `*` 的前缀），仅本次会话有效 |
+| `name` | 可选，`domain`/`open`/`close` 要操作的域 id；**多个用英文逗号分隔**（`"cleanup,security"`）。⚠ 刻意保持 `type: string` 而非 array：宿主按 parameters schema **严格校验**，改类型会让既有调用直接 `INVALID_ARGS`（2026-11-04 实测） |
 
-默认 deny 族：`sec_*` `red_*` `blue_*` `otw_*` `xp_*` `clyan_*` `video_*` `download_*`。
+默认 deny 族：`sec_*` `red_*` `blue_*` `otw_*` `xp_*` `clyan_*` `video_*` `download_*`（**`domain` 档下被忽略**，保留便于一行切回 `lean`）。
+
+## v0.3 的两个读数：让「切域」从盲选变成可算
+
+`status` 在 `domain` 档下除档位外还报两件事：
+
+```
+工具面 [domain·仅常驻] 收窄 295 个工具（全局面 440 个），省约 36,691 tok
+· 域外地板：138 个工具 / 24,437 tok（永不被收窄）
+· 域成本（18 个，降序）：ops-management(45/8440) · media-generation(30/4147) · ... 
+```
+
+- **`domainCosts`**：每个域的工具数与 token（降序，已开的标 `·已开`）。切之前先知道代价——空域与贵域从此都可见（**不可见的代价不会被清理，只会被遗忘**：实测 18 个域里曾有 7 个从未被用过）。
+- **`outside`（域外地板）**：不在任何域里的工具数与其体量。它们永不被收窄（fail-safe，见语义文档 I9 ③），所以这个数决定了「收窄最多能省多少」。
+
+为什么要有 `open`（累加）而不只是 `domain`（替换）：实测 33 天审计里真实切换 156 次（约 4.7 次/天），而「改插件 + 查情报 + 出素材」这类跨域活只能靠来回切，每切一次都要付一次全量 schema 快照（`tools.schemas()` 对每个工具深克隆 parameters，274 工具 ≈ 8s）。`open` 让并集一次生效。
 
 > `globalTools` 是**全局面**工具数（preset 作用域读到的 `schemas()` 是全局视图，含其他预设挂载的工具），不是本会话的模型可见数——后者由请求头 `tools` 实测（本机：收窄前 274 → 收窄后 208）。
 
