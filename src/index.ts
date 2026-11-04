@@ -81,6 +81,15 @@ export function apply(ctx: Context, config: Config): void {
   // schema 快照（tools.schemas() 对每个工具深克隆 parameters，274 工具 ≈ 8s，2026-09-26 剖面）。
   // 多域让并集一次生效；**不碰 I5**——仍是运行期状态，重启回预设默认，不落盘。
   let currentDomains: string[] = []
+  /** 上次 applyMode 时的全局工具数。 */
+  // 2026-11-04（主人批准）：补挂的**第二个正当理由**是「工具数变多」。
+  // 线上实测 load 瞬间 tools.schemas() 只有 329 个（插件没注册完）、稳定后 440 个，
+  // 而 deny 是按快照算的 ⇒ 19 个该收窄的工具一直可见（白占 2,554 tok/轮）。
+  // 旧守卫 `unmatched.length === 0` 在域模式下恒成立 ⇒ 永不重挂 ⇒ 缺口永久存在。
+  // ⚠ 声明必须在 applyMode 之前：load 会立即调用它（否则撞 TDZ）。
+  let lastToolCount = 0
+  /** 重入闸：applyMode 内部的 restrict() 会触发 tools/change，不设闸就是自激的引信。 */
+  let applying = false
   /** 上一行审计的关键字段指纹（除时间戳外）——同状态不重复落盘。 */
   let lastAuditKey = ''
 
@@ -122,6 +131,7 @@ export function apply(ctx: Context, config: Config): void {
     action: string,
     domainTargets?: readonly string[] | undefined,
   ): ToolSchemaLike[] => {
+    applying = true
     mode = next
     unmatched = []
     denied = []
@@ -197,6 +207,8 @@ export function apply(ctx: Context, config: Config): void {
       + `applied=${applied}，省约 ${cost.tokens} tok`,
     )
     void writeAudit(action, face)
+    lastToolCount = face.length
+    applying = false
     return face
   }
 
@@ -220,17 +232,35 @@ export function apply(ctx: Context, config: Config): void {
   let reapplyCount = 0
   let lastUnmatchedCount = unmatched.length
   ctx.on('tools/change', () => {
-    if (mode === 'full' || unmatched.length === 0) return
-    if (unmatched.length >= lastUnmatchedCount) return  // 未命中没变少 ⇒ 无新工具 ⇒ 不重试
+    // 旧判据只有「unmatched 变少」，它挡掉了 legit 的工具增长场景；新判据把
+    // 「工具数是否变多」也纳入，但**必须在重算后才知道**（schemas() 很贵且是唯一真源），
+    // 所以这里改成「先重算一次，再用结果决定要不要继续」——关闸条件见下。
+    if (applying || mode === 'full') return
+    // lean 档保持 2026-10-03 的原判据不变：它的「启动期快照不全」缺陷今天**没有被
+    // 实测证明**（实测的是 domain 档的 329 vs 440），不动没被证明有问题的地方。
+    // 这条分支也是那条自激回归测试的锚点，别顺手合并掉。
+    if (mode === 'lean') {
+      if (unmatched.length === 0) return
+      if (unmatched.length >= lastUnmatchedCount) return
+    }
     if (reapplyCount >= MAX_REAPPLY) return             // 封顶，防提供方持续抖动
     if (reapplyTimer !== undefined) clearTimeout(reapplyTimer)
     reapplyTimer = setTimeout(() => {
       reapplyTimer = undefined
-      if (mode === 'full' || unmatched.length === 0) return
-      if (unmatched.length >= lastUnmatchedCount) return
+      if (applying || mode === 'full') return
+      if (reapplyCount >= MAX_REAPPLY) return
+      const beforeToolCount = lastToolCount
+      const beforeUnmatched = lastUnmatchedCount
       reapplyCount += 1
       applyMode(mode, undefined, 'reapply', currentDomains)
       lastUnmatchedCount = unmatched.length
+      // ★ 关闸判据（防自激的核心）：重算后**工具数与未命中数都没变** ⇒ 这次 change
+      // 与工具集无关（多半是 restriction 自身变化触发的）⇒ 立刻关闸、不再排队。
+      // 这正是 2026-10-03 自激的形状：restrict → change → reapply → restrict……
+      // 有关闸时最坏只多算一次；无闸时会每 ~275ms 一轮，把日志写到 231 万行。
+      if (lastToolCount <= beforeToolCount && unmatched.length >= beforeUnmatched) {
+        reapplyCount = MAX_REAPPLY
+      }
     }, 250)
   })
 

@@ -25,7 +25,9 @@ function fakeCtx(state) {
   return {
     logger: () => ({ info: () => {}, warn: m => state.warns.push(String(m)), error: m => state.errors.push(String(m)) }),
     tools: {
-      schemas: () => SCHEMAS,
+      // 可变快照：模拟「启动期 tools.schemas() 不全 → 运行期陆续注册齐」这条真实路径
+      // （2026-11-04 线上实测 load 时 329 个、稳定后 440 个）。
+      schemas: () => state.schemas ?? SCHEMAS,
       restrict(filter) {
         state.restrictCalls.push(filter)
         if (state.restrictThrows) throw new Error('tools.restrict() requires a scoped context (agent.ctx)')
@@ -281,4 +283,42 @@ test('尸体：schema 校验器本身会拦——手工构造一个多字段的�
   const errs = validateSchema({ id: 'x', chars: 42 }, schema)
   assert.equal(errs.length, 1, '未声明字段必须被拦（否则本套 parity 测试恒真）')
   assert.match(errs[0], /chars/)
+})
+
+// ── 启动期快照不全（2026-11-04 线上实测，主人批准修） ────────────────────
+// 症状：load 时 tools.schemas() 只有 329 个工具（其他插件还没注册完），而
+// `deny = covered − keep` 是从那次快照算的 ⇒ 19 个该被收窄的工具从启动到关停
+// 一直可见（实测白占 2,554 tok/轮），直到手动切一次档才修正。
+// 根因：补挂守卫 `unmatched.length === 0` 在域模式下恒成立 ⇒ 永不重挂。
+// 那个守卫是 2026-10-03 自激事故（231 万行日志 / 34% CPU）留下的——治自激是对的，
+// 但把「工具数增长」这个正当的重挂理由也一起挡掉了。
+
+test('启动期工具未注册齐 ⇒ 工具数增长时补挂重算，新注册的域内工具必须被纳入 deny', async () => {
+  const state = await freshState()
+  // 启动瞬间：只有前 3 个（read / sec_hydra / sec_nmap）
+  state.schemas = SCHEMAS.slice(0, 3)
+  apply(fakeCtx(state), domainCfg())
+  assert.deepEqual(state.restrictCalls[0].deny, ['sec_hydra', 'sec_nmap'],
+    '启动瞬间只能 deny 已知的域内工具（这就是快照不全的现场）')
+
+  // 运行期：其余工具陆续注册（clyan_scan 属 cleanup 域）
+  state.schemas = SCHEMAS
+  const before = state.restrictCalls.length
+  state.handlers['tools/change']()
+  await new Promise(r => setTimeout(r, 600))   // 越过 250ms 去抖
+
+  assert.ok(state.restrictCalls.length > before, '工具数变多必须触发补挂（否则漏 deny 永久生效）')
+  const last = state.restrictCalls[state.restrictCalls.length - 1]
+  assert.ok(last.deny.includes('clyan_scan'), '新注册的域内工具必须进入 deny')
+})
+
+test('尸体：工具数没变时反复触发 tools/change ⇒ 最多重算 1 次（不自激）', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), domainCfg())
+  const before = state.restrictCalls.length
+  const handler = state.handlers['tools/change']
+  for (let i = 0; i < 30; i += 1) handler()   // 模拟 restrict() 自身触发的 change 风暴
+  await new Promise(r => setTimeout(r, 800))
+  const extra = state.restrictCalls.length - before
+  assert.ok(extra <= 1, '工具数没变时最多重算 1 次，实际 ' + extra + ' 次 —— 自激！')
 })
