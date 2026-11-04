@@ -32,7 +32,7 @@
 |------|------|
 | 工具面（tool face） | 一次请求里模型可见的工具 schema 集合；宿主口径 `toolsTokens = ceil(len(JSON.stringify(header.tools))/4) + 4` |
 | 档位（mode） | `lean` = 按 deny 收窄；`full` = 全量可见；**`domain` = 只留常驻集 + 指定域**（2026-10-31 新增，主人定调「按需开启，只有少数插件常驻」） |
-| 域（domain） | 域 id → 一组工具模式；**域 id 对齐技能 id**。`toolface(action="domain", name=X)` 只开该域 |
+| 域（domain） | 域 id → 一组工具模式；**域 id 对齐技能 id**。`domain`＝替换为给定域；`open`／`close`＝累加／移除；多域用 `name: "a,b"`（英文逗号分隔，v0.3 起） |
 | 常驻集（resident） | 任何域下都可见的工具模式。判据两条：① 不带它无法**工作** ② 不带它无法**恢复**（重启链路 `preflight_*`/`daemon_*` 属后者，2026-10-31 实测踩过死锁） |
 | deny 模式（pattern） | 精确工具名，或尾随 `*` 的前缀（如 `sec_*`） |
 | 命中/未命中 | 模式是否解析到当前已注册的全局工具名；未命中不得静默丢弃 |
@@ -54,6 +54,8 @@
   - **① 常驻集必含「恢复链路」**：`resident` 的判据有两条——不带它无法**工作**，或不带它无法**恢复**。后者极易漏：`preflight_*`/`daemon_*` 曾只放在 `plugin-admin` 域里 ⇒ 「仅常驻」档下预检→重启闭环直接断掉（实测 `unknown tool`），而切域的结果又会被重启重置 ⇒ 死锁。补进 resident 后收窄数 266→264（正好少 deny 这 2 个）。
   - **② 域 id 对齐技能 id**：一个域 = 一组「只在做那一类活时才需要」的工具。
   - **③ 域外工具永不被 deny**（fail-safe）：不在任何域里的工具（官方基础工具、尚未归类的新插件）自动常驻。**失败方向是「多可见」而不是「突然消失」**——想 deny 就必须显式归类，归错也只影响那一族。判据实现在 `planDomain`：`deny = coveredTools().filter(n => !keep.has(n))`，`keep = resident ∪ 目标域`，`covered` 只含被某个域显式覆盖的工具。
+  - **④ 多域要么全开、要么不开**（v0.3，2026-11-04）：`planDomain` 接受域 id 数组，取并集；**任一目标域不存在 ⇒ `known=false`、零 deny、`unknownDomains` 逐个列出**。不做「开一半」——半开会让「我以为开了 A+B、实际只有 A」变成一个沉默的假读数，而失败方向必须是多可见（同 ③）。**切换失败时保留原已开域**：在 A 域里误传一个拼错的域名，不许把 A 也清空。
+  - **⑤ 档位切换的四种语义必须互不混淆**（v0.3）：`domain`＝**替换**（只开给到的域，v0.2 行为不变）；`open`＝**累加**（并入已开集合，用于一类跨域活要同时用到两类工具）；`close`＝**移除**（不给 name = 清空回只常驻）；`full`＝**撤销全部收窄**。⚠ 累加存在的前提是**单域曾造成真实的往复成本**：33 天审计 2,205 行里真实切换 156 次（约 4.7 次/天），而每次切换都要付一次全量 schema 快照（`tools.schemas()` 对每个工具深克隆 parameters，274 工具 ≈ 8s，2026-09-26 剖面）。
 
 ## 5 · 契约（含调用点清单）
 
@@ -81,11 +83,17 @@
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `action` | string（必填） | `status` 查看 / `lean` 收窄 / `full` 全量 / **`domain` 按域开启** |
+| `action` | string（必填） | `status` 查看 / `lean` 收窄 / `full` 全量 / **`domain` 替换为给定域** / **`open` 累加开启** / **`close` 关闭给定域** |
 | `deny` | string[] | 可选，`lean` 时覆盖配置的 deny 模式（本次会话内有效） |
-| `name` | string | 可选，`domain` 时指定要开启的域 id；**省略 = 只留常驻集**（这是 `mode=domain` 的默认态，不是错误态） |
+| `name` | string | 可选，`domain`/`open`/`close` 要操作的域 id；**多个用英文逗号分隔**（`"cleanup,security"`）。`domain` 省略 = 只留常驻集（`mode=domain` 的默认态，不是错误态）；`close` 省略 = 全部关闭。⚠ **刻意保持 `type: string` 而非 array**：宿主按 parameters schema 严格校验（2026-11-04 实测 `"name" must be an array`），改类型会让既有调用直接 INVALID_ARGS——那是破坏兼容，不是新能力 |
 
-返回：`{ ok, mode, domain?, domains[], applied, deniedCount, globalTools, savedChars, savedTokens, unmatched[], reason? }`。
+返回：`{ ok, mode, domain?, openDomains[], domains[], domainCosts?, outside?, applied, deniedCount, globalTools, savedChars, savedTokens, unmatched[], reason? }`。
+
+v0.3 增补三个字段，回答「切之前先知道代价」：
+
+- `openDomains[]`：**已开域列表**（`domain` 保留为「第一个已开域」，兼容旧读者）。
+- `domainCosts[]`：**每个域的工具数与 token**（降序，仅 `mode=domain` 时给）。让空域与贵域都可见——18 个域里曾有 7 个从未被用过，而它们的成本一直不可见（**不可见的代价不会被清理，只会被遗忘**）。
+- `outside{ tools, tokens }`：**域外地板**——不在任何域里的工具数与其体量。它们永不被收窄（I9 ③），所以这个数决定了「收窄最多能省多少」。
 
 `globalTools` 是**全局面**计数（preset 作用域的 `schemas()` 是全局视图）；**本会话模型可见数**由请求头实测，不由本工具报告（见 §9 实践修订 ①）。
 
@@ -143,9 +151,11 @@
 | 2026-09-13 | ③ 挂载点判据被宿主源码确认 | `tools.restrict()` 源码明确拒绝无作用域调用（"a context-global restriction would mask every agent"）——印证「挂 preset 而非 host 组合」是唯一正确落点 |
 | 2026-10-03 | **④ 补挂自激循环 → 新增 I7/I8 + 验收 7/8** | 现象：web 进程 **34% 单核持续占用**（15 秒烧 5.13 CPU 秒；进程累计 39,027 CPU 秒 ≈ 10.8 小时）、`toolface-events.log` 涨到 **2,311,441 行 / 439 MB**（每 ~275 ms 一行、内容完全相同）、主人从会话轨迹观察到「命令 263 ms 就完成了，之后近 1 分钟主模型请求无响应且未进入思考状态」。根因：原补挂判据「存在未命中模式」在配置含 `sec_*/red_*/blue_*/otw_*/xp_*`（**永不命中**）时恒为真，而补挂内的 `restrict()/lift()` 又触发 `tools/change` ⇒ 自激。修法：判据改为「未命中数变少」+ 次数封顶 + 审计按状态去重。**★ 语义缺口就在本文档本身**：原 §8 把错误判据当作规格写下（「仅当存在未命中模式时重解析」），而 §4 无不变量、§7 无对应验收 ⇒ **文档写了机制、没写它必须满足的约束**。教训：语义文档的不变量必须包含**收敛性**（触发条件可满足且会终止），而不只是"做了什么"。 |
 
+| 2026-11-04 | **⑤ 单域 → 多域（v0.3）：新增 `open`/`close`，`status` 报域成本与域外地板** | 33 天审计读数（2,205 行 / 真实切换 156 次 ≈ 4.7 次/天）＋全局面工具从 **247 涨到 451（+82%）** 而域映射靠手写维护。原先 `currentDomain: string` 只存一个域 ⇒ 跨域活（改插件→查情报→出素材）必须来回切，每次付一次全量 schema 快照（274 工具 ≈ 8s）。修法：域状态改数组 + 新增 `open`（累加）/`close`（移除），`domain` 保持**替换**语义不变（零破坏）；`status` 增报 `domainCosts`（每域工具数/token）与 `outside`（域外地板 = 收窄能省多少的上限）。⚠ **不碰 I5**：仍是运行期状态、不落盘、重启回预设默认。⚠ 途中被宿主拦下一次：把 `name` 的 schema 从 string 改成 array 会让既有调用直接 INVALID_ARGS（实测 `"name" must be an array`）⇒ 多域改用**英文逗号分隔**，schema 保持 string。 |
+
 ## 10 · 未决问题
 
 1. **lean 默认是否含 `wq_`（30 工具 / 1,922 tok）**：14 天内有 485 次调用（挖掘轮集中使用），暂留可见；若改为 deny，需接受「挖掘前先切档」的仪式。
 2. **跨实例共享档位是否需要每会话隔离**：当前跟随预设 standing mount 语义（共享）；若并行实例频繁互相干扰，再评估按 `agent.ctx` 逐 agent 挂载。
 3. **`savedTokens` 的口径**：按 4 字符/token 估算单工具，而宿主对整份 header 计价含包装开销——两者存在 ±数个百分点差异，报告已标注为估算。
-4. **是否需要「按任务类型预设档位」**（如 mining/security 档）：当前只有 lean/full 两档，先观察真实使用频率再决定。
+4. **多域已落地，「按任务类型预设档位」仍未做**：v0.3（2026-11-04）给了 `open`/`close` 与域成本读数，让「跨域活不必来回切」成立；但没有做「任务类型 → 域集合」的预设（如 mining = quant-research + evidence-retrieval）。判据：若日志里反复出现**同样的域组合**（同一批 id 在一次会话里被连续 open），再做预设——先等真实形状出现，不先造名词。

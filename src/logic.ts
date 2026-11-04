@@ -117,6 +117,26 @@ export interface DomainPlan {
   unmatched: string[]
   /** 目标域是否存在——false 时调用方须 fail-loud，不许静默当「没东西可开」。 */
   known: boolean
+  /** 不存在的目标域 id（多域时逐个列出；`known=false` 时非空）。 */
+  unknownDomains: string[]
+}
+
+/** 单个域的体量读数（`status` 用它回答「开这个域要花多少」）。 */
+export interface DomainCost {
+  id: string
+  tools: number
+  chars: number
+  tokens: number
+}
+
+/** 域覆盖读数：被某个域覆盖的工具数 vs 域外工具（后者是收窄的永久地板）。 */
+export interface DomainCoverage {
+  /** 被任一域显式覆盖的工具数——只有这些才可能被 deny。 */
+  covered: number
+  /** 域外工具数：永远可见，构成收窄的地板。 */
+  outside: number
+  /** 域外工具的模型面体量（token 估算）。 */
+  outsideTokens: number
 }
 
 /**
@@ -137,8 +157,14 @@ export function planDomain(
   allTools: readonly string[],
   domains: DomainMap,
   resident: readonly string[],
-  target: string | undefined,
+  target: readonly string[] | string | undefined,
 ): DomainPlan {
+  // 归一化：单字符串 / 数组 / undefined 一律收成有序去重数组。
+  // 保留单字符串形态是**向后兼容**（既有调用点与测试传 'quant'）；
+  // 数组形态是 v0.3 的多域：一次开多个域，`deny` 只留这些域 ∩ 常驻。
+  const targets: string[] = target === undefined
+    ? []
+    : (typeof target === 'string' ? [target] : [...new Set(target)])
   const names = [...allTools]
   const residentTools = expandPatterns(resident, names).matched
 
@@ -151,9 +177,9 @@ export function planDomain(
     return [...covered].sort()
   }
 
-  // target === undefined ⇒「只常驻」：不额外开任何域。
+  // targets 为空 ⇒「只常驻」：不额外开任何域。
   // 这不是错误态（它是 mode=domain 的默认状态），故 known=true、unmatched 为空。
-  if (target === undefined) {
+  if (targets.length === 0) {
     const keep = new Set(residentTools)
     return {
       deny: coveredTools().filter(n => !keep.has(n)),
@@ -161,18 +187,98 @@ export function planDomain(
       residentTools,
       unmatched: [],
       known: true,
+      unknownDomains: [],
     }
   }
 
-  const patterns = domains[target]
-  if (patterns === undefined) {
-    return { deny: [], domainTools: [], residentTools, unmatched: [target], known: false }
+  // 多域（v0.3）：逐个解析后取并集。**任一目标域不存在 ⇒ 整体 fail-loud 且零 deny**，
+  // 不做「开一半」——半开会让「我以为开了 A+B、实际只有 A」变成一个沉默的假读数，
+  // 而失败方向必须是「多可见」（见 I9 ③）。
+  const unknownDomains: string[] = []
+  const domainTools = new Set<string>()
+  const unmatched: string[] = []
+  for (const one of targets) {
+    const patterns = domains[one]
+    if (patterns === undefined) {
+      unknownDomains.push(one)
+      continue
+    }
+    const plan = expandPatterns(patterns, names)
+    for (const hit of plan.matched) domainTools.add(hit)
+    for (const miss of plan.unmatched) unmatched.push(miss)
   }
-  const targetPlan = expandPatterns(patterns, names)
+  if (unknownDomains.length > 0) {
+    return {
+      deny: [],
+      domainTools: [],
+      residentTools,
+      unmatched: [...unknownDomains, ...unmatched],
+      known: false,
+      unknownDomains,
+    }
+  }
 
-  const keep = new Set<string>([...residentTools, ...targetPlan.matched])
+  const keptDomainTools = [...domainTools].sort()
+  const keep = new Set<string>([...residentTools, ...keptDomainTools])
   const deny = coveredTools().filter(n => !keep.has(n))
-  return { deny, domainTools: targetPlan.matched, residentTools, unmatched: targetPlan.unmatched, known: true }
+  return {
+    deny,
+    domainTools: keptDomainTools,
+    residentTools,
+    unmatched,
+    known: true,
+    unknownDomains: [],
+  }
+}
+
+/**
+ * 逐域体量：每个域展开后占多少工具 / 多少模型面 token（降序）。
+ *
+ * 存在理由（2026-11-04）：`status` 原先只报「有哪些域」，不报「开它要花多少」——
+ * 于是切域是盲选。实测 18 个域里 7 个从未使用过，而它们的成本一直不可见
+ * （不可见的代价不会被清理，只会被遗忘）。
+ *
+ * @param schemas - 当前可见 schema 列表（唯一体量真源）。
+ * @param domains - 域定义表。
+ * @returns 每域一行，按 token 降序；未命中任何工具的域仍列出（tools=0，暴露拼写错误）。
+ */
+export function domainCosts(
+  schemas: readonly ToolSchemaLike[],
+  domains: DomainMap,
+): DomainCost[] {
+  const names = schemas.map(s => s.name)
+  const rows: DomainCost[] = []
+  for (const [id, patterns] of Object.entries(domains)) {
+    const matched = expandPatterns(patterns, names).matched
+    const cost = faceCost(schemas, matched)
+    rows.push({ id, tools: cost.count, chars: cost.chars, tokens: cost.tokens })
+  }
+  rows.sort((a, b) => (b.tokens - a.tokens) || a.id.localeCompare(b.id))
+  return rows
+}
+
+/**
+ * 域覆盖读数：被域覆盖的工具（可被 deny 的候选）vs 域外工具（永久地板）。
+ *
+ * 为什么需要它：域外工具**永不被 deny**（I9 ③ fail-safe），它们构成收窄的下限。
+ * 不报这个数，就无法回答「收窄最多能省多少」——省下的量与地板高度是同一件事的两面。
+ *
+ * @param schemas - 当前可见 schema 列表。
+ * @param domains - 域定义表。
+ * @returns 覆盖数 / 域外数 / 域外体量。
+ */
+export function domainCoverage(
+  schemas: readonly ToolSchemaLike[],
+  domains: DomainMap,
+): DomainCoverage {
+  const names = schemas.map(s => s.name)
+  const covered = new Set<string>()
+  for (const patterns of Object.values(domains)) {
+    for (const hit of expandPatterns(patterns, names).matched) covered.add(hit)
+  }
+  const outsideNames = names.filter(n => !covered.has(n))
+  const cost = faceCost(schemas, outsideNames)
+  return { covered: covered.size, outside: outsideNames.length, outsideTokens: cost.tokens }
 }
 
 /** 审计行入参。 */

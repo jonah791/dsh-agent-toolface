@@ -31,7 +31,7 @@ function fakeCtx(state) {
         if (state.restrictThrows) throw new Error('tools.restrict() requires a scoped context (agent.ctx)')
         return () => { state.lifted.push(true) }
       },
-      register: def => { state.registered.push(def.name) },
+      register: def => { state.registered.push(def.name); state.toolDefs[def.name] = def },
     },
     on: (evt, cb) => { state.events.push(evt); state.handlers[evt] = cb },
   }
@@ -40,7 +40,7 @@ function fakeCtx(state) {
 async function freshState() {
   const dir = await mkdtemp(join(tmpdir(), 'toolface-'))
   process.env['DSH_HOME'] = dir
-  return { dir, restrictCalls: [], lifted: [], registered: [], events: [], handlers: {}, warns: [], errors: [] }
+  return { dir, restrictCalls: [], lifted: [], registered: [], events: [], handlers: {}, warns: [], errors: [], toolDefs: {} }
 }
 
 const { apply } = await import('../lib/index.js')
@@ -117,4 +117,94 @@ test('apply：unmatched 恒定（无新工具注册）时 tools/change 不重挂
   await new Promise(r => setTimeout(r, 500))        // 越过 250 ms 去抖
   assert.equal(state.restrictCalls.length, before,
     'unmatched 未变少时不得重挂（否则自激：每 ~275ms 一次全量 schema 快照）')
+})
+
+// ── v0.3 多域开关（open / close / domain 替换） ──────────────────────────
+// 这三条走工具入口（execute），logic 层测不到——而它们才是「开关策略」的实质。
+async function callTool(state, args) {
+  const def = state.toolDefs['toolface']
+  return await def.execute(args, {})
+}
+
+/** 带域表的装载配置：cleanup=clyan_* / security=sec_* / resident=read。
+ *  SCHEMAS 里 read 与 red_dir_brute 不在任何域 ⇒ 永久可见（域外地板）。 */
+function domainCfg() {
+  return {
+    mode: 'domain',
+    domains: { cleanup: ['clyan_*'], security: ['sec_*'] },
+    resident: ['read'],
+    deny: [],
+  }
+}
+
+test('open：累加——开第二个域不关掉第一个', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), domainCfg())
+  await callTool(state, { action: 'open', name: 'cleanup' })
+  assert.deepEqual(state.restrictCalls[state.restrictCalls.length - 1].deny, ['sec_hydra', 'sec_nmap'])
+  const r = await callTool(state, { action: 'open', name: 'security' })
+  assert.deepEqual([...r.openDomains].sort(), ['cleanup', 'security'])
+  // 两域并集覆盖了全部域内工具 ⇒ deniedCount=0。
+  // ⚠ 此时**不会**新增 restrict 调用（原验收 4：deny 为空时不调 restrict，避免宿主对空收窄抛错），
+  // 所以判据必须看返回值，不能看「最后一次 restrict 调用」——它在收窄解除时会停在旧值上。
+  assert.equal(r.deniedCount, 0, '两域并集覆盖全部域内工具 ⇒ 无可 deny 项')
+})
+
+test('domain：替换语义（v0.2 行为不变）——只留最后给的那个域', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), domainCfg())
+  await callTool(state, { action: 'open', name: 'cleanup' })
+  const r = await callTool(state, { action: 'domain', name: 'security' })
+  assert.deepEqual(r.openDomains, ['security'])
+  assert.deepEqual(state.restrictCalls[state.restrictCalls.length - 1].deny, ['clyan_scan'])
+})
+
+test('close：移除指定域；不带 name 则清空回只常驻', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), domainCfg())
+  await callTool(state, { action: 'open', name: 'cleanup' })
+  await callTool(state, { action: 'open', name: 'security' })
+  const after = await callTool(state, { action: 'close', name: 'cleanup' })
+  assert.deepEqual(after.openDomains, ['security'])
+  const all = await callTool(state, { action: 'close' })
+  assert.deepEqual(all.openDomains, [])
+})
+
+test('open：name 缺失 ⇒ ok=false 且不重挂（不许静默 no-op）', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), domainCfg())
+  const before = state.restrictCalls.length
+  const r = await callTool(state, { action: 'open' })
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /需要 name/)
+  assert.equal(state.restrictCalls.length, before)
+})
+
+test('open：重复开同一个域 ⇒ 幂等，不新增 restrict 调用（I2）', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), domainCfg())
+  await callTool(state, { action: 'open', name: 'cleanup' })
+  const before = state.restrictCalls.length
+  await callTool(state, { action: 'open', name: 'cleanup' })
+  assert.equal(state.restrictCalls.length, before, '已开的域不应触发重挂')
+})
+
+test('status：报已开域 + 各域成本 + 域外地板（切之前先知道代价）', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), domainCfg())
+  await callTool(state, { action: 'open', name: 'cleanup,security' })
+  const r = await callTool(state, { action: 'status' })
+  assert.deepEqual([...r.openDomains].sort(), ['cleanup', 'security'])
+  assert.ok(Array.isArray(r.domainCosts) && r.domainCosts.length === 2)
+  assert.ok(r.domainCosts.every(c => typeof c.tools === 'number' && typeof c.tokens === 'number'))
+  assert.equal(r.outside.tools, 2, 'read 与 red_dir_brute 在域外')
+})
+
+test('尸体：open 一个拼错的域名不改变已开域（不许因为拼错就把状态清空）', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), domainCfg())
+  await callTool(state, { action: 'open', name: 'cleanup' })
+  const r = await callTool(state, { action: 'open', name: 'typo-domain' })
+  assert.match(r.reason, /未知域/, '必须响亮报出未知域')
+  assert.deepEqual(r.openDomains, ['cleanup'], '已开域必须保留')
 })
