@@ -283,9 +283,15 @@ export function apply(ctx: Context, config: Config): void {
             items: {
               type: 'object',
               additionalProperties: false,
+              // ⚠ 每个字段都必须在这里声明：宿主按 `additionalProperties: false` 校验返回值，
+              // 多返回一个未声明字段会让**整个工具调用失败**（不是被裁剪）。
+              // 2026-11-04 实测踩到：返回了 chars 但没声明 ⇒ `"value.domainCosts[0].chars"
+              // is not a declared property`，status 直接不可用。测试当时只断言字段类型，
+              // 没跑 output schema 校验 ⇒ 测试绿而线上红。已补 schema-parity 用例。
               properties: {
                 id: { type: 'string', required: true },
                 tools: { type: 'number', required: true },
+                chars: { type: 'number', required: true },
                 tokens: { type: 'number', required: true },
               },
             },

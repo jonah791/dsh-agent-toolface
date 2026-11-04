@@ -208,3 +208,77 @@ test('尸体：open 一个拼错的域名不改变已开域（不许因为拼错
   assert.match(r.reason, /未知域/, '必须响亮报出未知域')
   assert.deepEqual(r.openDomains, ['cleanup'], '已开域必须保留')
 })
+
+// ── output schema 一致性（2026-11-04 实测踩到） ──────────────────────────
+// 症状：status 返回 domainCosts[].chars，而 output schema 只声明了 id/tools/tokens，
+// 宿主按 additionalProperties:false 校验 ⇒ 整个调用失败：
+//   tool "toolface" returned invalid output: "value.domainCosts[0].chars" is not a declared property
+// 根因：测试只断言字段**类型**，没跑 output schema 校验 ⇒ 测试绿而线上红。
+// 判据：每个 action 的返回值都必须通过它自己的 output schema。
+
+/** 最小 JSON-schema 校验器（只覆盖本插件 schema 用到的 keyword） */
+function validateSchema(value, schema, path = '$', errs = []) {
+  if (schema === undefined) return errs
+  const t = schema.type
+  if (t === 'object') {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      errs.push(path + ' 应为 object')
+      return errs
+    }
+    const props = schema.properties ?? {}
+    for (const [k, sub] of Object.entries(props)) {
+      if (sub?.required === true && !(k in value)) errs.push(path + '.' + k + ' 缺失（required）')
+      else if (k in value) validateSchema(value[k], sub, path + '.' + k, errs)
+    }
+    if (schema.additionalProperties === false) {
+      for (const k of Object.keys(value)) {
+        if (!(k in props)) errs.push(path + '.' + k + ' 未声明（additionalProperties:false）')
+      }
+    }
+  } else if (t === 'array') {
+    if (!Array.isArray(value)) { errs.push(path + ' 应为 array'); return errs }
+    value.forEach((v, i) => validateSchema(v, schema.items, path + '[' + i + ']', errs))
+  } else if (t === 'number') {
+    if (typeof value !== 'number') errs.push(path + ' 应为 number')
+  } else if (t === 'string') {
+    if (typeof value !== 'string') errs.push(path + ' 应为 string')
+  } else if (t === 'boolean') {
+    if (typeof value !== 'boolean') errs.push(path + ' 应为 boolean')
+  }
+  return errs
+}
+
+test('schema-parity：每个 action 的返回值都通过自身 output schema', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), domainCfg())
+  const schema = state.toolDefs['toolface'].output.schema
+  assert.ok(schema, 'toolface 应声明 output.schema')
+
+  const cases = [
+    { action: 'status' },
+    { action: 'open', name: 'cleanup,security' },
+    { action: 'domain', name: 'cleanup' },
+    { action: 'close', name: 'cleanup' },
+    { action: 'close' },
+    { action: 'full' },
+    { action: 'lean', deny: ['sec_*'] },
+    { action: 'open' },              // 缺 name ⇒ ok:false 分支也要合规
+    { action: 'domain', name: 'nope' }, // 未知域分支
+  ]
+  for (const args of cases) {
+    const r = await callTool(state, args)
+    const errs = validateSchema(r, schema)
+    assert.deepEqual(errs, [], 'action=' + args.action + ' 返回值不合 output schema：' + errs.join('; '))
+  }
+})
+
+test('尸体：schema 校验器本身会拦——手工构造一个多字段的返回值必须报错', () => {
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: { id: { type: 'string', required: true } },
+  }
+  const errs = validateSchema({ id: 'x', chars: 42 }, schema)
+  assert.equal(errs.length, 1, '未声明字段必须被拦（否则本套 parity 测试恒真）')
+  assert.match(errs[0], /chars/)
+})
