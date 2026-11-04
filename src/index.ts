@@ -227,9 +227,12 @@ export function apply(ctx: Context, config: Config): void {
   //   新判据把「未命中恒定」这一真实语义表达出来：没有新工具注册 ⇒ 重试无意义。
   // 启动期各插件连续注册工具会连发 tools/change，逐次 applyMode 等于逐次全量 schema 快照
   // ⇒ 去抖合并成一次（交互式切换走工具入口，不经这里，故不影响响应性）。
-  const MAX_REAPPLY = 5
+  const MAX_REAPPLY = 12
+  /** 连续「无进展」几次才关闸。2 是给启动期**分批注册**留的容错轮次（见下方关闸注释）。 */
+  const MAX_EMPTY_REAPPLY = 2
   let reapplyTimer: ReturnType<typeof setTimeout> | undefined
   let reapplyCount = 0
+  let emptyReapply = 0
   let lastUnmatchedCount = unmatched.length
   ctx.on('tools/change', () => {
     // 旧判据只有「unmatched 变少」，它挡掉了 legit 的工具增长场景；新判据把
@@ -253,14 +256,18 @@ export function apply(ctx: Context, config: Config): void {
       const beforeUnmatched = lastUnmatchedCount
       reapplyCount += 1
       applyMode(mode, undefined, 'reapply', currentDomains)
+      // 「有进展」= 工具数涨了 **或** 未命中数变少了。有进展就重置空转计数、继续跟；
+      // 连续 MAX_EMPTY_REAPPLY 次无进展才关闸。
+      // ⚠ 为什么不是「一次无进展就关闸」（v0.3.0 初版实测踩到）：启动期工具是**分批**
+      // 注册的——第一次补挂时工具数只涨了 2 个（实测 deny 280→282，而正确值是 299），
+      // 紧接着那次 restrict 自身触发的 change 被判「无进展」⇒ 立刻关闸 ⇒ 后面 158 个
+      // 工具的注册全被忽略。给一轮容错，分批注册才跟得完。
+      // ⚠ 防自激仍有界：restrict→change→reapply 的自激每轮都「无进展」，
+      // 连续 2 次即关闸 ⇒ 最坏多算 2 次（远好过 2026-10-03 的每 ~275ms 一轮）。
+      const progressed = lastToolCount > beforeToolCount || unmatched.length < beforeUnmatched
+      emptyReapply = progressed ? 0 : emptyReapply + 1
       lastUnmatchedCount = unmatched.length
-      // ★ 关闸判据（防自激的核心）：重算后**工具数与未命中数都没变** ⇒ 这次 change
-      // 与工具集无关（多半是 restriction 自身变化触发的）⇒ 立刻关闸、不再排队。
-      // 这正是 2026-10-03 自激的形状：restrict → change → reapply → restrict……
-      // 有关闸时最坏只多算一次；无闸时会每 ~275ms 一轮，把日志写到 231 万行。
-      if (lastToolCount <= beforeToolCount && unmatched.length >= beforeUnmatched) {
-        reapplyCount = MAX_REAPPLY
-      }
+      if (emptyReapply >= MAX_EMPTY_REAPPLY) reapplyCount = MAX_REAPPLY
     }, 250)
   })
 

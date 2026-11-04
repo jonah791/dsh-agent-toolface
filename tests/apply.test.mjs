@@ -322,3 +322,30 @@ test('尸体：工具数没变时反复触发 tools/change ⇒ 最多重算 1 �
   const extra = state.restrictCalls.length - before
   assert.ok(extra <= 1, '工具数没变时最多重算 1 次，实际 ' + extra + ' 次 —— 自激！')
 })
+
+test('启动期分批注册：中间夹一次「无进展」的 change 不得提前关闸', async () => {
+  const state = await freshState()
+  state.schemas = SCHEMAS.slice(0, 3)          // 启动瞬间：read/sec_hydra/sec_nmap
+  apply(fakeCtx(state), domainCfg())
+  const handler = state.handlers['tools/change']
+  const base = state.restrictCalls.length
+
+  // 批次 1：red_dir_brute 注册进来（工具数涨了，但它不在任何域 ⇒ deny 不变）
+  state.schemas = SCHEMAS.slice(0, 4)
+  handler()
+  await new Promise(r => setTimeout(r, 400))
+  assert.equal(state.restrictCalls.length, base + 1, '批次 1 应触发一次补挂')
+
+  // 夹一次「无进展」（模拟 restrict 自身触发的 change，此时工具集没动）
+  handler()
+  await new Promise(r => setTimeout(r, 400))
+
+  // 批次 2：clyan_scan 注册进来（属 cleanup 域 ⇒ 必须被纳入 deny）
+  state.schemas = SCHEMAS
+  handler()
+  await new Promise(r => setTimeout(r, 400))
+
+  const last = state.restrictCalls[state.restrictCalls.length - 1]
+  assert.ok(last.deny.includes('clyan_scan'),
+    '夹一次无进展后仍须跟到后续批次——v0.3.0 初版在这里提前关闸，实测 deny 停在 282 而正确值是 299')
+})
