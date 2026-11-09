@@ -133,3 +133,30 @@ test('尸体：sticky 下即使宿主没有 tools.guard()，也不回落到 rest
   assert.equal(state.restrictCalls.length, 0)
   assert.ok(state.warns.some(w => w.includes('tools.guard()')))
 })
+
+test('按需取用：调 skill 时自动开启同名域（不必人记得 open）', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), { mode: 'domain', domains: DOMAINS, resident: RESIDENT, sticky: false })
+  const before = state.restrictCalls.length
+  state.handlers['session/event']({}, {
+    type: 'tool/call',
+    data: { name: 'skill', arguments: '{"name":"security"}' },
+  })
+  await new Promise(r => setImmediate(r))
+  assert.equal(state.restrictCalls.length, before + 1, '应自动重挂一次收窄')
+  const deny = state.restrictCalls[state.restrictCalls.length - 1].deny
+  assert.equal(deny.includes('sec_hydra'), false, '该域道具应到手')
+  assert.equal(deny.includes('clyan_scan'), true, '别的域仍应被收窄')
+})
+
+test('尸体：技能没有同名域时，按需取用不得动工具面', async () => {
+  const state = await freshState()
+  apply(fakeCtx(state), { mode: 'domain', domains: DOMAINS, resident: RESIDENT, sticky: false })
+  const before = state.restrictCalls.length
+  state.handlers['session/event']({}, {
+    type: 'tool/call',
+    data: { name: 'skill', arguments: '{"name":"fault-localization"}' },
+  })
+  await new Promise(r => setImmediate(r))
+  assert.equal(state.restrictCalls.length, before, '没配道具的技能不该触发任何重挂')
+})

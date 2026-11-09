@@ -11,13 +11,13 @@
 # dsh-agent-toolface
 
 <p align="center">
-  <a href="https://github.com/jonah791/dsh-agent-toolface"><img src="https://img.shields.io/badge/version-0.3.0-blue" alt="version"></a>
+  <a href="https://github.com/jonah791/dsh-agent-toolface"><img src="https://img.shields.io/badge/version-0.5.0-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-52%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-61%20passed-brightgreen" alt="tests">
 </p>
 
-**一句话**：决定「一场会话的模型能看到哪些工具」——`lean` 按 deny 集收窄、`domain` 按技能域开启（`open` 累加 / `close` 移除）、`full` 一键全量恢复，并**报出每一档的代价**（每域工具数与 token、域外地板）。
+**一句话**：决定「一场会话的模型能看到哪些工具」——`lean` 按 deny 集收窄、`domain` 按技能域开启（`open` 累加 / `close` 移除）、`full` 一键全量恢复，**调 `skill` 加载同名技能时自动开域**（v0.5「按需取用」），并**报出每一档的代价**（每域工具数与 token、域外地板）。
 
 **为什么值得用**：一次请求的工具 schema 是**固定上下文成本**——压缩回收不掉，且工具越多、选择越被稀释。实测（2026-09-13，本机）：
 
@@ -60,6 +60,23 @@
 
 > `globalTools` 是**全局面**工具数（preset 作用域读到的 `schemas()` 是全局视图，含其他预设挂载的工具），不是本会话的模型可见数——后者由请求头 `tools` 实测（本机：收窄前 274 → 收窄后 208）。
 
+## v0.4 / v0.5：从「开关」到「按需取用」
+
+**v0.4 · 恒定 schema（`sticky: true`）**：`tools` 数组位于缓存前缀最前面，改一个字节就整条前缀重算——2026-11-09 实测（单会话 474 次请求）短间隔命中率 <50% 的 16 条**全部**紧跟在工具面变化之后，单次代价 8 万–38 万 tokens。`sticky` 下**从不调用 `restrict`**：可见集在会话内恒定，开关改走 `tools.guard()` 执行前门禁（宿主 `notify: false`，不进前缀），变更只写进工具返回值（「只注入变更」）。默认 `false` 是**兼容决定**——不静默换掉其他预设的收窄语义。
+
+**v0.5 · 按需取用**：调 `skill` 时解析 `arguments.name`，若存在**同名域**且未开启 ⇒ 自动开域。
+
+```
+加载 skill: ops-management
+→ toolface: 工具面 [domain] · ops-management(45/8440·已开)
+```
+
+45 个道具跟着技能一起到手，**不必人记得 `open`**。代价要说清：开域这一次仍付一次前缀重算——但只发生在「我主动想起某个技能」之后，而不是每轮都付。
+
+**边界（诚实的缺口）**：不加载技能、直接干活时道具不会自己出现，要靠常驻的 `toolface open`。这条链路绑在「想起某个技能」这个动作上，绑不到「我心里想要个工具」上。
+
+**三层模型**（本插件背后的设计，落地判据就在配置里）：技能域 = **身体**（完整、恒定）· 常驻工具 = **条件反射**（少、稳、抬手够得到）· 域内工具 = **道具**（想起技能才出现）。`resident` 划在「反射」那一层，其余按 `domains` 分层。
+
 ## 快速开始
 
 **1) 装依赖**（profile 的 `node_modules` 里需能解析到本插件，与其它自研插件同款 link）：
@@ -89,6 +106,9 @@
 |----|------|------|
 | `mode` | `lean` | 启动档位；**非法值（非 `lean`/`full`）加载即抛错**（不静默降级） |
 | `deny` | `[]` | 收窄模式列表：精确工具名，或尾随 `*` 的前缀通配（如 `sec_*`） |
+| `domains` | `{}` | 域定义：域 id → 工具模式（`mode=domain` 时生效）。**域 id 与技能名同名时，加载该技能即自动开启**（v0.5） |
+| `resident` | `[]` | 常驻模式：任何域下都可见（跨域通用工具）。应放「不解思索就要用」的那一层（条件反射） |
+| `sticky` | `false` | `true` = 恒定 schema：从不调 `restrict`，开关走执行前门禁，关域不再重算前缀（v0.4） |
 
 ## 落盘与自证（出问题时先看这里）
 
@@ -97,7 +117,7 @@
 | 字段 | 含义 |
 |------|------|
 | `at` | ISO 时间戳 |
-| `action` | `load`（预设默认档生效）/ `lean` / `full` |
+| `action` | `load`（预设默认档生效）/ `lean` / `full` / `domain` / `open` / `close`；`reason` 里的 `auto-skill:<技能>` = 这次是按需取用自动开的域 |
 | `mode` | 切换后的档位 |
 | `applied` | 是否真的调用了 `restrict`（`false` = 未命中或 `restrict` 抛错，配合 `reason` 看） |
 | `deniedCount` | 被 deny 的工具数 |
@@ -138,9 +158,11 @@ tail -3 "$DSH_HOME/toolface-events.log"
 npm test        # = node --test "tests/*.test.mjs"
 ```
 
-**20 例离线测试**（跑 `tests/`，纯逻辑层，不依赖宿主运行时）：
-- `tests/logic.test.mjs` — 模式解析（`expandPatterns`）、体量估算（`faceCost`）、档位决策（`denyFor`）、审计行（`auditLine`，含「`reason` 存在时才写该字段」）
-- `tests/apply.test.mjs` — apply 路径：非法 `mode` 抛错、全未命中时不调用 `restrict`、`restrict` 抛错时插件仍加载并报 `applied=false`
+**61 例离线测试**（跑 `tests/`，纯逻辑层，不依赖宿主运行时）：
+- `tests/logic.test.mjs`（22 例） — 模式解析（`expandPatterns`）、体量估算（`faceCost`）、档位决策（`denyFor`）、域覆盖与域成本（`domainCoverage` / `domainCosts`）、常量段里含中文 JSON 的解析（`constantSegment`）、审计行（`auditLine`，含「`reason` 存在时才写该字段」）
+- `tests/apply.test.mjs`（20 例） — apply 路径：非法 `mode` 抛错、全未命中时不调用 `restrict`、`restrict` 抛错时插件仍加载并报 `applied=false`、事件订阅接线
+- `tests/multi-domain.test.mjs`（10 例） — 多域语义：`open` 累加 / `close` 移除 / 域外地板不被收窄
+- `tests/sticky.test.mjs`（9 例） — 恒定 schema：load 不调 `restrict`、门禁放行与拦截、**按需取用**（调 `skill` 自动开同名域）、逃生门（`toolface` 与 `run_code` 永不被门禁锁死）；含两条尸体测试（`sticky=false` 旧语义不变 / 宿主无 `guard()` 时不回落到 `restrict`，宁可明报不偷偷改前缀）
 
 无网络、无外部依赖（`ctx.tools` 以桩替代）。
 

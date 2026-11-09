@@ -53,7 +53,8 @@ test('apply：lean 档把模式展开成具体工具名并调用 restrict', asyn
   assert.equal(state.restrictCalls.length, 1)
   assert.deepEqual(state.restrictCalls[0].deny, ['red_dir_brute', 'sec_hydra', 'sec_nmap'])
   assert.deepEqual(state.registered, ['toolface'])
-  assert.deepEqual(state.events, ['tools/change'])
+  // v0.4 起除 tools/change 外还订阅 session/event（按需取用：调 skill 时自动开同名域）
+  assert.deepEqual(state.events, ['tools/change', 'session/event'])
 })
 
 test('apply：未命中的模式不静默——写入 warning 且不出现在 deny 里', async () => {

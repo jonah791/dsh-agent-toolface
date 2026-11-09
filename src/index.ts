@@ -373,6 +373,42 @@ export function apply(ctx: Context, config: Config): void {
     }, 250)
   })
 
+  // ── 按需取用（v0.4 · 2026-11-09 主人定调）────────────────────────────────────
+  // 「技能域才是身体，常驻工具是条件反射，其余是道具。」——道具不该绑在身上，但也不该
+  // 靠「我记得先 open」来取（那是纪律，不是机制）。域 id 与技能 id 对齐是既有口径，
+  // 所以「加载技能 X」与「开启域 X」本是同一件事：技能内容进尾部（回忆），道具进手边。
+  // 这里把两者耦合：调 skill 时解析技能 id，若存在同名域且未开启 ⇒ 自动 open。
+  // 代价与手动 open 相同（一次全量 schema 重算），但从此只发生在**有意识的动作**之后。
+  // ⚠ 不递归：applyMode 内部的 applying 闸已挡掉 restrict→tools/change 自激。
+  ctx.on('session/event', (_session, event) => {
+    const ev = event as unknown as {
+      type?: string
+      data?: { name?: string; arguments?: unknown }
+    }
+    if (ev.type !== 'tool/call' || ev.data?.name !== 'skill') return
+    const raw = ev.data?.arguments
+    if (typeof raw !== 'string') return
+    let skillId: string | undefined
+    try {
+      const parsed = JSON.parse(raw) as { name?: unknown }
+      if (typeof parsed.name === 'string') skillId = parsed.name.trim()
+    } catch {
+      return   // 参数不是 JSON（正常路径也偶发流式半截）⇒ 静默跳过，取用不成就走手动 open
+    }
+    if (skillId === undefined || skillId === '') return
+    if (mode !== 'domain' || currentDomains.includes(skillId)) return
+    if (config.domains[skillId] === undefined) return   // 技能在身体里但没配道具 ⇒ 什么都不做
+    const merged = [...currentDomains, skillId]
+    setImmediate(() => {
+      try {
+        applyMode('domain', undefined, 'auto-skill:' + skillId, merged)
+        logger.info(`按需取用：加载技能 ${skillId} ⇒ 自动开启同名域`)
+      } catch (err) {
+        logger.warn(`技能自动取用失败（${skillId}）: ${(err as Error).message}`)
+      }
+    })
+  })
+
   ctx.tools.register(defineTool({
     name: 'toolface',
     description:
