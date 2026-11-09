@@ -41,6 +41,21 @@ export interface Config {
   domains: Record<string, string[]>
   /** 常驻模式：任何域下都可见（跨域通用工具）。`mode=domain` 时生效。 */
   resident: string[]
+  /**
+   * 恒定 schema（v0.4，2026-11-09 主人定调「只注入变更」）。
+   *
+   * true = 运行时**从不**调用 `tools.restrict()`：可见工具集在会话内恒定，
+   * 开关改为「执行前门禁 + 工具返回值里的变更说明」，两者都不进请求前缀。
+   * false（默认）= 旧行为（每次开关都重挂收窄，会让缓存前缀整条作废）。
+   *
+   * 为什么需要它：`tools` 数组位于缓存前缀最前面，改一个字节 ⇒ 整条前缀重算。
+   * 2026-11-09 实测（会话 3e786db2 / 474 次请求）：短间隔 ≤120 秒里命中率 <50% 的
+   * 16 条，16/16 都紧跟在工具面变化之后；单次代价 8 万–38 万 tokens。
+   *
+   * ⚠ 默认 false 是**兼容决定**：其他挂载本插件的预设不该被静默换掉收窄语义。
+   * 要用恒定 schema 的预设显式写 `sticky: true`。
+   */
+  sticky: boolean
 }
 
 export const Config = z.object({
@@ -48,11 +63,14 @@ export const Config = z.object({
   deny: z.array(z.string()).default([]),
   domains: z.dict(z.array(z.string())).default({}),
   resident: z.array(z.string()).default([]),
+  sticky: z.boolean().default(false),
 })
 
 interface ToolsLike {
   schemas(scope?: unknown): ToolSchemaLike[]
   restrict(filter: { deny?: string[]; allow?: string[] }): () => void
+  /** 执行前门禁：返回原因即拒调。不参与请求前缀（宿主 `notify: false`）。 */
+  guard?(guard: (execution: { name?: unknown }) => string | undefined): () => void
 }
 
 export function apply(ctx: Context, config: Config): void {
@@ -92,6 +110,73 @@ export function apply(ctx: Context, config: Config): void {
   let applying = false
   /** 上一行审计的关键字段指纹（除时间戳外）——同状态不重复落盘。 */
   let lastAuditKey = ''
+
+  // ── v0.4 恒定 schema 的门禁状态 ─────────────────────────────────────────────
+  // 开关不再改「可见工具集」（那会改请求头的 tools 数组 ⇒ 整条前缀作废），
+  // 改为维护一个「被门禁拒绝」的集合；门禁在工具体之前求值，不进请求前缀。
+  /** 当前被门禁拒绝的工具名。 */
+  let gatedSet = new Set<string>()
+  /** 上一轮门禁集——用来算「本次变更」。 */
+  let previousGated = new Set<string>()
+  /** 本次调用的变更增量（写进工具返回值，不新建任何注入）。 */
+  let nowAvailable: string[] = []
+  let nowGated: string[] = []
+  /** 工具 → 覆盖它的域（门禁报错时说清「该开哪个域」）。 */
+  let owningDomains = new Map<string, string[]>()
+  let gateLift: (() => void) | undefined
+  /** 永不被门禁：本工具自身是逃生门，`run_code` 是宿主保留的呈现层传输名。 */
+  const GATE_EXEMPT = new Set(['toolface', 'run_code'])
+
+  const buildOwningDomains = (allNames: readonly string[]): Map<string, string[]> => {
+    const map = new Map<string, string[]>()
+    for (const [id, patterns] of Object.entries(config.domains)) {
+      for (const hit of expandPatterns(patterns, allNames).matched) {
+        const prev = map.get(hit)
+        if (prev === undefined) map.set(hit, [id])
+        else if (!prev.includes(id)) prev.push(id)
+      }
+    }
+    return map
+  }
+
+  /**
+   * 重挂执行前门禁。
+   *
+   * 宿主在 `tools/pre-execute` 瀑布之后、工具体之前求值它，返回原因即拒；注册时
+   * `notify: false`（`tools/src/index.ts:1144`）⇒ **不触发 tools/change、不进请求前缀**。
+   * 这是「开关」唯一不付缓存代价的挂点：拒调发生在请求已经发完之后。
+   */
+  const applyGate = (): void => {
+    if (gateLift !== undefined) {
+      try {
+        gateLift()
+      } catch (err) {
+        logger.warn(`撤销旧门禁失败: ${(err as Error).message}`)
+      }
+      gateLift = undefined
+    }
+    const guard = tools.guard
+    if (guard === undefined) {
+      if (gatedSet.size > 0) {
+        logger.warn('宿主无 tools.guard()：sticky 下门禁不可用，被门禁的工具实际仍可调用')
+      }
+      return
+    }
+    if (gatedSet.size === 0) return
+    gateLift = guard((execution) => {
+      const n = execution.name
+      // 门禁热路径：先查集合，再做任何字符串工作。
+      if (typeof n !== 'string' || GATE_EXEMPT.has(n) || !gatedSet.has(n)) return undefined
+      const owned = owningDomains.get(n)
+      const where = owned === undefined || owned.length === 0 ? '未归类域' : owned.join(' / ')
+      const openCmd = owned === undefined || owned.length === 0
+        ? ''
+        : `需要时先调 toolface({action:"open", name:"${owned[0]}"})；`
+      return `工具 "${n}" 属域 [${where}]，本会话当前未开启。${openCmd}`
+        + `当前已开域：${currentDomains.length === 0 ? '（仅常驻）' : currentDomains.join(', ')}。`
+        + `（这是门禁拒绝，不是能力缺失——工具定义始终在上下文里，开关不会破坏缓存。）`
+    })
+  }
 
   const writeAudit = async (action: string, face: ToolSchemaLike[]): Promise<void> => {
     try {
@@ -189,7 +274,16 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
 
-    if (denied.length > 0) {
+    if (config.sticky) {
+      // 恒定 schema（v0.4）：**这里不调 restrict**。工具面一变，请求头的 tools 数组就变，
+      // 而 tools 位于缓存前缀最前面 ⇒ 整条前缀作废（2026-11-09 实测：单次 8 万–38 万 tokens，
+      // 短间隔 16/16 整轮未命中全跟在工具面变化之后）。开关改走 applyGate()。
+      applied = false
+      owningDomains = buildOwningDomains(allNames)
+      gatedSet = new Set(denied.filter(n => !GATE_EXEMPT.has(n)))
+      applyGate()
+    } else if (denied.length > 0) {
+      gatedSet = new Set()
       try {
         lift = tools.restrict({ deny: denied })
         applied = true
@@ -199,12 +293,20 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
 
+    // 变更增量：写进工具返回值（追加，不进前缀），不新建任何注入通道。
+    nowAvailable = [...previousGated].filter(n => !gatedSet.has(n)).sort()
+    nowGated = [...gatedSet].filter(n => !previousGated.has(n)).sort()
+    previousGated = new Set(gatedSet)
+
     const cost = faceCost(face, denied)
     const domainLabel = currentDomains.length === 0 ? '' : '(' + currentDomains.join(',') + ')'
     logger.info(
-      `工具面档位 ${mode}${domainLabel}：`
-      + `收窄 ${denied.length} 项（全局面 ${face.length} 个工具），`
-      + `applied=${applied}，省约 ${cost.tokens} tok`,
+      config.sticky
+        ? `工具面档位 ${mode}${domainLabel}：schema 恒定（${face.length} 个工具始终可见），`
+          + `门禁 ${gatedSet.size} 项，本次变更 +${nowAvailable.length}/-${nowGated.length}`
+        : `工具面档位 ${mode}${domainLabel}：`
+          + `收窄 ${denied.length} 项（全局面 ${face.length} 个工具），`
+          + `applied=${applied}，省约 ${cost.tokens} tok`,
     )
     void writeAudit(action, face)
     lastToolCount = face.length
@@ -281,7 +383,9 @@ export function apply(ctx: Context, config: Config): void {
       + 'status 会报每个域的工具数与 token（切之前先看代价）以及「域外地板」——不在任何域里的工具永不被收窄，'
       + '它决定收窄最多能省多少。'
       + '收窄只作用于本会话（agent 作用域），不影响其他会话或子代理；档位不持久化，重启回到预设默认。'
-      + '当某个族的工具在当前会话不可见时，先用它恢复（full / domain / open），再执行任务。',
+      + '⚠ sticky 档（恒定 schema）：工具定义始终可见，但**未开启域的工具调用会被门禁拒绝**——'
+      + '被拒时不要以为能力缺失，按报错提示 open 对应域即可；开关不破坏缓存，随时可切。'
+      + '当某个族的工具报「未开启域」时，先用 open 开启它，再执行任务。',
     parameters: {
       action: {
         type: 'string',
@@ -342,6 +446,14 @@ export function apply(ctx: Context, config: Config): void {
             },
           },
           applied: { type: 'boolean', required: true },
+          /** v0.4：true = schema 恒定、开关走门禁（不破坏缓存前缀）。 */
+          sticky: { type: 'boolean' },
+          /** v0.4：当前被门禁拒绝的工具数（不进上下文，只是调用被拒）。 */
+          gatedCount: { type: 'number' },
+          /** 本次调用新增可用的工具名（追加在返回值里，不进前缀）。 */
+          nowAvailable: { type: 'array', items: { type: 'string' } },
+          /** 本次调用转为门禁的工具名。 */
+          nowGated: { type: 'array', items: { type: 'string' } },
           deniedCount: { type: 'number', required: true },
           globalTools: { type: 'number', required: true },
           savedChars: { type: 'number', required: true },
@@ -359,6 +471,10 @@ export function apply(ctx: Context, config: Config): void {
           domainCosts?: Array<{ id?: string; tools?: number; tokens?: number }>
           outside?: { tools?: number; tokens?: number }
           applied?: boolean
+          sticky?: boolean
+          gatedCount?: number
+          nowAvailable?: string[]
+          nowGated?: string[]
           deniedCount?: number
           globalTools?: number
           savedChars?: number
@@ -373,6 +489,16 @@ export function apply(ctx: Context, config: Config): void {
         const lines: string[] = []
         if (r.mode === 'full') {
           lines.push(`工具面 [full] 全局面 ${total} 个工具可见（收窄已解除）`)
+        } else if (r.sticky === true) {
+          const tag = r.mode === 'domain'
+            ? (openList.length === 0 ? 'domain·仅常驻' : 'domain: ' + openList.join('+'))
+            : 'lean'
+          lines.push(`工具面 [${tag}] schema 恒定：${total} 个工具始终可见（开关不改前缀）`)
+          lines.push(
+            `· 门禁 ${r.gatedCount ?? r.deniedCount ?? 0} 个工具当前不可调用`
+            + `（它们仍在上下文里，只是调用会被拒——省掉的是每次切换的全量重算）`,
+          )
+          if (r.reason !== undefined) lines.push(`· 注意：${r.reason}`)
         } else {
           const tag = r.mode === 'domain'
             ? (openList.length === 0 ? 'domain·仅常驻' : 'domain: ' + openList.join('+'))
@@ -382,6 +508,18 @@ export function apply(ctx: Context, config: Config): void {
             + `省约 ${r.savedTokens ?? 0} tok（${r.savedChars ?? 0} 字符）`,
           )
           if (r.applied === false) lines.push(`· 收窄未生效：${r.reason ?? '未知原因'}`)
+        }
+        // v0.4 变更增量：这是「只注入变更」的落点——它就是工具返回值的一部分，
+        // 天然追加进历史、不进请求前缀，不需要任何新的注入通道。
+        const added = Array.isArray(r.nowAvailable) ? r.nowAvailable : []
+        const gatedNow = Array.isArray(r.nowGated) ? r.nowGated : []
+        if (added.length > 0 || gatedNow.length > 0) {
+          const brief = (list: string[]): string =>
+            list.slice(0, 10).join(', ') + (list.length > 10 ? ` …共 ${list.length} 个` : '')
+          const parts: string[] = []
+          if (added.length > 0) parts.push(`新增可用 ${added.length} 个：${brief(added)}`)
+          if (gatedNow.length > 0) parts.push(`转为门禁 ${gatedNow.length} 个：${brief(gatedNow)}`)
+          lines.push('· 本次变更：' + parts.join('；'))
         }
         // 域外地板：收窄能省多少的上限由它决定（域外工具永不被 deny，见 I9 ③）。
         if (r.mode === 'domain' && r.outside !== undefined) {
@@ -503,10 +641,19 @@ export function apply(ctx: Context, config: Config): void {
           ? {}
           : { outside: { tools: coverage.outside, tokens: coverage.outsideTokens } }),
         applied,
-        deniedCount: denied.length,
+        // v0.4：sticky 下 deniedCount 报的是「门禁数」而不是「从上下文移除数」，
+        // savedChars/savedTokens 恒为 0——因为确实一个字符都没从上下文里去掉。
+        // ⚠ 必须恒为布尔：宿主按 output schema 严格校验，值为 undefined 的键会让整条返回值作废
+        // （2026-11-09 实测：裸 config 未经 Schemastery 填默认值时 config.sticky 是 undefined，
+        //  schema-parity 用例当场报 `$.sticky 应为 boolean`）。
+        sticky: config.sticky === true,
+        gatedCount: gatedSet.size,
+        nowAvailable: [...nowAvailable],
+        nowGated: [...nowGated],
+        deniedCount: config.sticky ? gatedSet.size : denied.length,
         globalTools: face.length,
-        savedChars: cost.chars,
-        savedTokens: cost.tokens,
+        savedChars: config.sticky ? 0 : cost.chars,
+        savedTokens: config.sticky ? 0 : cost.tokens,
         unmatched,
         ...(reason === undefined ? {} : { reason }),
       }

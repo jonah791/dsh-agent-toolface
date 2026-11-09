@@ -1,7 +1,7 @@
 {
     "name": "dsh-agent-toolface",
-    "version": "0.3.0",
-    "description": "工具面分档：在 agent 作用域内按证据化的 deny 集收窄模型可见工具（lean/full/domain 切换 + 审计留痕），降低工具 schema 的固定上下文成本与选择稀释。v0.3 起支持多域（open 累加 / close 移除），status 报每域成本与「域外地板」，让切域从盲选变成可算。",
+    "version": "0.4.0",
+    "description": "工具面分档：在 agent 作用域内按证据化的 deny 集收窄模型可见工具（lean/full/domain 切换 + 审计留痕），降低工具 schema 的固定上下文成本与选择稀释。v0.3 起支持多域（open 累加 / close 移除），status 报每域成本与「域外地板」。v0.4 起可开 sticky：**schema 恒定、开关改走执行前门禁**——因为 tools 数组在缓存前缀最前面，每次切换都会让整条前缀重算（2026-11-09 实测单次 8 万–38 万 tokens）；sticky 下切换零前缀代价，变更只写进工具返回值（「只注入变更」）。",
     "type": "module",
     "main": "lib/index.js",
     "types": "lib/types/index.d.ts",
