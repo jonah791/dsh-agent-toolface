@@ -14,6 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { appendFile, mkdir } from 'node:fs/promises'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   auditLine,
@@ -56,6 +57,14 @@ export interface Config {
    * 要用恒定 schema 的预设显式写 `sticky: true`。
    */
   sticky: boolean
+  /**
+   * 恒定工具面（v0.6，2026-11-09）：`mode=domain` 时**不收窄**——工具清单一个字节都不动，
+   * 开域只把「这批可用」记进状态。域内工具以 `deferLoading` 声明常驻，因此清单恒定、
+   * 请求前缀稳定，开/关域都不再触发整段重算。
+   *
+   * ⚠ 默认 false 是**兼容决定**：其他挂载本插件的预设仍走「收窄」语义。
+   */
+  constantFace: boolean
 }
 
 export const Config = z.object({
@@ -64,18 +73,73 @@ export const Config = z.object({
   domains: z.dict(z.array(z.string())).default({}),
   resident: z.array(z.string()).default([]),
   sticky: z.boolean().default(false),
+  constantFace: z.boolean().default(false),
 })
+
+interface ToolDefinitionLike {
+  readonly name: string
+  execute(args: unknown, exec: unknown): Promise<unknown>
+}
 
 interface ToolsLike {
   schemas(scope?: unknown): ToolSchemaLike[]
   restrict(filter: { deny?: string[]; allow?: string[] }): () => void
   /** 执行前门禁：返回原因即拒调。不参与请求前缀（宿主 `notify: false`）。 */
   guard?(guard: (execution: { name?: unknown }) => string | undefined): () => void
+  /**
+   * 按名取工具定义。**省略 scope 即全局视图**（宿主 JSDoc：「omitted = the global view」），
+   * 因此 agent 作用域 restrict 掉的工具在这里依然取得到——这是按需执行通道的依据
+   * （收窄只过滤 agent 视图，不注销注册；2026-11-09 读 tools/src/index.ts:1186-1226 确认）。
+   */
+  get?(name: string, scope?: unknown): ToolDefinitionLike | undefined
+}
+
+/** 技能库根目录：道具声明住在技能里，这是它的真源。 */
+function skillRoots(): string[] {
+  const home = process.env['USERPROFILE'] ?? process.env['HOME'] ?? ''
+  return [join(home, '.agents', 'skills'), join(process.env['DSH_HOME'] ?? '', 'skills')]
+}
+
+/**
+ * 读技能目录里的 `tools.yml`：每个技能声明它拥有哪些工具模式。
+ *
+ * 为什么搬到这里（2026-11-09 主人定调「工具和技能密不可分」）：域配置原先住在
+ * cordis.yml，技能住在另一个目录，两边各说各话 —— 于是「读一个技能」不会带来它的道具，
+ * 还得手工 open 一个名字未必对得上的域。道具搬进技能目录后，读技能 = 拿到手脚，
+ * 知识、道具、用法在同一处。cordis.yml 的 domains 保留为兜底（未搬的域照旧生效）。
+ * @param roots - 技能库根目录，按顺序读，先读到的技能优先。
+ * @returns 技能 id → 工具模式数组；没有 tools.yml 的技能不出现在结果里。
+ */
+function loadSkillToolDomains(roots: readonly string[]): Record<string, string[]> {
+  const out: Record<string, string[]> = {}
+  for (const root of roots) {
+    if (root === '') continue
+    let entries
+    try { entries = readdirSync(root, { withFileTypes: true }) } catch { continue }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.') || out[entry.name] !== undefined) continue
+      let raw: string
+      try { raw = readFileSync(join(root, entry.name, 'tools.yml'), 'utf8') } catch { continue }
+      const patterns: string[] = []
+      let inTools = false
+      for (const line of raw.split(String.fromCharCode(10)).map(l => l.trimEnd())) {
+        if (/^tools:\s*$/.test(line)) { inTools = true; continue }
+        if (!inTools) continue
+        const hit = /^\s*-\s*(.+?)\s*$/.exec(line)
+        if (hit === null) { if (/^\S/.test(line)) inTools = false; continue }
+        patterns.push((hit[1] ?? '').replace(/^['"]|['"]$/g, ''))
+      }
+      if (patterns.length > 0) out[entry.name] = patterns
+    }
+  }
+  return out
 }
 
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('agent-toolface')
   const tools = ctx.tools as unknown as ToolsLike
+  // 技能目录优先：技能自带的 tools.yml 覆盖同名的 cordis.yml 域，未搬的域继续走配置。
+  const domains: Record<string, string[]> = { ...config.domains, ...loadSkillToolDomains(skillRoots()) }
 
   const initial = parseMode(config.mode)
   if (initial === undefined) {
@@ -99,6 +163,15 @@ export function apply(ctx: Context, config: Config): void {
   // schema 快照（tools.schemas() 对每个工具深克隆 parameters，274 工具 ≈ 8s，2026-09-26 剖面）。
   // 多域让并集一次生效；**不碰 I5**——仍是运行期状态，重启回预设默认，不落盘。
   let currentDomains: string[] = []
+  /**
+   * 单独放行的具体工具名（会话级，不落盘）。
+   *
+   * 主人 2026-11-09 定调：**按需取用某个具体的工具，而不是开一整个域**。
+   * 开一个域是 30–45 个 schema 全进来，实际往往只用其中 1–2 个。
+   * 实现是把这些名字从 deny 里剔除（deny 是「不可见清单」，拿掉谁谁就可见），
+   * 所以 pick 的粒度就是 1 个工具，代价也就是那 1 个工具。
+   */
+  const pinned = new Set<string>()
   /** 上次 applyMode 时的全局工具数。 */
   // 2026-11-04（主人批准）：补挂的**第二个正当理由**是「工具数变多」。
   // 线上实测 load 瞬间 tools.schemas() 只有 329 个（插件没注册完）、稳定后 440 个，
@@ -106,6 +179,17 @@ export function apply(ctx: Context, config: Config): void {
   // 旧守卫 `unmatched.length === 0` 在域模式下恒成立 ⇒ 永不重挂 ⇒ 缺口永久存在。
   // ⚠ 声明必须在 applyMode 之前：load 会立即调用它（否则撞 TDZ）。
   let lastToolCount = 0
+  /**
+   * 历史见过的全部工具名。
+   *
+   * ⚠ 为什么 deny 的基础不能只用 `tools.schemas()` 的当次结果（2026-11-09 实测）：
+   * 收窄会缩小 visible ⇒ 下一次重算拿到的快照更小 ⇒ deny 随之萎缩（越算越松）。
+   * 症状：重启后常驻集从 116 涨到 169（新注册的 eac_/remote_ 等永远进不了 deny），
+   * 手动切一次档才回落到 116。
+   * `restrict()` 的 known 检查走 restrictableNames（含已被收窄的名字），
+   * 所以累积下来的旧名字仍然可以被 deny。
+   */
+  const seenNames = new Set<string>()
   /** 重入闸：applyMode 内部的 restrict() 会触发 tools/change，不设闸就是自激的引信。 */
   let applying = false
   /** 上一行审计的关键字段指纹（除时间戳外）——同状态不重复落盘。 */
@@ -124,12 +208,12 @@ export function apply(ctx: Context, config: Config): void {
   /** 工具 → 覆盖它的域（门禁报错时说清「该开哪个域」）。 */
   let owningDomains = new Map<string, string[]>()
   let gateLift: (() => void) | undefined
-  /** 永不被门禁：本工具自身是逃生门，`run_code` 是宿主保留的呈现层传输名。 */
-  const GATE_EXEMPT = new Set(['toolface', 'run_code'])
+  /** 永不被门禁：本工具自身是逃生门，`tool_call` 是按需执行通道，`run_code` 是宿主保留的呈现层传输名。 */
+  const GATE_EXEMPT = new Set(['toolface', 'tool_call', 'run_code'])
 
   const buildOwningDomains = (allNames: readonly string[]): Map<string, string[]> => {
     const map = new Map<string, string[]>()
-    for (const [id, patterns] of Object.entries(config.domains)) {
+    for (const [id, patterns] of Object.entries(domains)) {
       for (const hit of expandPatterns(patterns, allNames).matched) {
         const prev = map.get(hit)
         if (prev === undefined) map.set(hit, [id])
@@ -238,6 +322,9 @@ export function apply(ctx: Context, config: Config): void {
     // 单次 apply 就烧掉约 40s（冷启 60s 的主因，任务 t-bec5b8b7）。
     const face = tools.schemas()
     const allNames = face.map(s => s.name)
+    for (const name of allNames) seenNames.add(name)
+    /** deny 的作用域：累积名（只增不减），而不是当次快照——见 seenNames 的注释。 */
+    const denyable = [...seenNames]
 
     if (mode === 'domain') {
       // 按域（v0.3 起可多域）：只 deny「被域覆盖 ∧ 非常驻 ∧ 非任一目标域」的工具。
@@ -248,23 +335,24 @@ export function apply(ctx: Context, config: Config): void {
       // 也不让状态悄悄变成「什么都没开 / 只开了一半」。
       const previous = currentDomains
       const requested = [...(domainTargets ?? [])]
-      const plan = planDomain(allNames, config.domains, config.resident, requested)
+      const plan = planDomain(denyable, domains, config.resident, requested)
       unmatched = plan.unmatched
       if (!plan.known) {
         currentDomains = previous
-        const known = Object.keys(config.domains).sort().join(', ')
+        const known = Object.keys(domains).sort().join(', ')
         const bad = plan.unknownDomains.join(', ')
         reason = `未知域 ${bad}；已配置域：${known === '' ? '（无）' : known}`
         logger.warn(`工具面按域跳过：${reason}`)
       } else {
         currentDomains = requested
-        denied = plan.deny
+        // 恒定工具面：清单一个字节都不动（域内工具以 deferLoading 声明常驻）⇒ 前缀稳定。
+        denied = config.constantFace === true ? [] : plan.deny
       }
     } else {
       currentDomains = []
       const patterns = denyFor(mode, config.deny, override)
       if (patterns.length > 0) {
-        const plan = expandPatterns(patterns, allNames)
+        const plan = expandPatterns(patterns, denyable)
         unmatched = plan.unmatched
         denied = plan.matched
         if (plan.matched.length === 0) {
@@ -272,6 +360,12 @@ export function apply(ctx: Context, config: Config): void {
           logger.warn(`工具面收窄跳过：${reason}（未命中 ${unmatched.join(', ')}）`)
         }
       }
+    }
+
+    // 单工具放行：被 pick 的名字从 deny 里剔除 ⇒ 在本档位下可见。
+    // 放在 sticky 判断之前，两条路径（restrict / 门禁）都吃到同一份 denied。
+    if (pinned.size > 0 && denied.length > 0) {
+      denied = denied.filter(name => !pinned.has(name))
     }
 
     if (config.sticky) {
@@ -288,8 +382,27 @@ export function apply(ctx: Context, config: Config): void {
         lift = tools.restrict({ deny: denied })
         applied = true
       } catch (err) {
-        reason = (err as Error).message
-        logger.error(`工具面收窄失败（本会话保持全量可见）: ${reason}`)
+        // 累积集里的名字可能已被卸载（插件卸载会注销工具）。剔掉再试一次——
+        // 否则这一条错误会让收窄**永久**失效（每轮都失败），失效形态是静默降级到全量可见。
+        const message = (err as Error).message
+        const stale = [...message.matchAll(/"([^"]+)"/g)]
+          .map(hit => hit[1] ?? '')
+          .filter(name => seenNames.has(name))
+        if (stale.length > 0) {
+          for (const name of stale) seenNames.delete(name)
+          const keep = new Set(denied.filter(name => !stale.includes(name)))
+          logger.warn(`剔除已卸载的工具名 ${stale.length} 个后重试收窄: ${stale.join(', ')}`)
+          try {
+            lift = tools.restrict({ deny: [...keep] })
+            applied = true
+          } catch (retryErr) {
+            reason = (retryErr as Error).message
+            logger.error(`工具面收窄失败（本会话保持全量可见）: ${reason}`)
+          }
+        } else {
+          reason = message
+          logger.error(`工具面收窄失败（本会话保持全量可见）: ${reason}`)
+        }
       }
     }
 
@@ -397,7 +510,7 @@ export function apply(ctx: Context, config: Config): void {
     }
     if (skillId === undefined || skillId === '') return
     if (mode !== 'domain' || currentDomains.includes(skillId)) return
-    if (config.domains[skillId] === undefined) return   // 技能在身体里但没配道具 ⇒ 什么都不做
+    if (domains[skillId] === undefined) return   // 技能在身体里但没配道具 ⇒ 什么都不做
     const merged = [...currentDomains, skillId]
     setImmediate(() => {
       try {
@@ -416,6 +529,9 @@ export function apply(ctx: Context, config: Config): void {
       + 'lean=按 deny 列表收窄；full=全量可见；domain=按域（只留常驻集 + 指定域，不指定则只留常驻）。'
       + 'domain 是**替换**（只开给到的域）；open 是**累加**（并入已开集合，用于一类跨域活要同时用到两类工具时）；'
       + 'close 是移除（不给 name = 清空回只常驻）。'
+      + '**pick / unpick 是单工具粒度**：只放行「具体某一个工具」（name=工具名，逗号分隔），不动整个域——'
+      + '开一个域是 30–45 个 schema 全进来，实际往往只用 1–2 个；pick 的代价就是那 1–2 个。'
+      + '⚠ full 会被直接拒绝，除非带 reason——除特殊情况不要开 full，优先 pick 具体工具、其次 open 必要的域。'
       + 'status 会报每个域的工具数与 token（切之前先看代价）以及「域外地板」——不在任何域里的工具永不被收窄，'
       + '它决定收窄最多能省多少。'
       + '收窄只作用于本会话（agent 作用域），不影响其他会话或子代理；档位不持久化，重启回到预设默认。'
@@ -427,8 +543,10 @@ export function apply(ctx: Context, config: Config): void {
         type: 'string',
         required: true,
         description: 'status=查看当前档位/已开域/各域成本；lean=按 deny 列表收窄；'
-          + 'full=恢复全量可见；domain=替换为给定域（不给 name 则只留常驻集）；'
-          + 'open=累加开启（保留已开域）；close=关闭给定域（不给 name 则全部关闭）',
+          + 'pick=按需放行具体工具（推荐，name 填工具名）；unpick=收回；'
+          + 'domain=替换为给定域（不给 name 则只留常驻集）；'
+          + 'open=累加开启（保留已开域）；close=关闭给定域（不给 name 则全部关闭）；'
+          + 'full=恢复全量可见（必须带 reason，除特殊情况禁用）',
       },
       deny: {
         type: 'array',
@@ -442,7 +560,13 @@ export function apply(ctx: Context, config: Config): void {
         // 多域改用逗号分隔（SQL 式习惯，零破坏）：name: "cleanup,security"。
         type: 'string',
         description: 'domain/open/close 要操作的域 id；多个用英文逗号分隔（如 "cleanup,security"）。'
-          + 'domain 省略=只留常驻集、close 省略=全部关闭。各域成本见 status 的 domainCosts',
+          + 'domain 省略=只留常驻集、close 省略=全部关闭。各域成本见 status 的 domainCosts。'
+          + 'pick/unpick 时这里是**具体工具名**（逗号分隔，如 "comfy_submit,comfy_status"）',
+      },
+      reason: {
+        type: 'string',
+        description: 'action=full 时**必填**：为什么必须全量可见（主人 2026-11-09：除特殊情况禁止开 full）。'
+          + '缺这个字段的 full 请求会被直接拒绝，不执行。',
       },
     },
     output: {
@@ -496,6 +620,8 @@ export function apply(ctx: Context, config: Config): void {
           savedTokens: { type: 'number', required: true },
           unmatched: { type: 'array', items: { type: 'string' }, required: true },
           reason: { type: 'string' },
+          /** v0.5：当前被单独放行的具体工具名（单工具粒度，见 pick/unpick）。 */
+          picked: { type: 'array', items: { type: 'string' } },
         },
       },
       render: (_args, value) => {
@@ -517,12 +643,20 @@ export function apply(ctx: Context, config: Config): void {
           savedTokens?: number
           unmatched?: string[]
           reason?: string
+          ok?: boolean
+          picked?: string[]
         }
         const total = r.globalTools ?? 0
         const openList = Array.isArray(r.openDomains)
           ? r.openDomains
           : (r.domain === undefined ? [] : [r.domain])
         const lines: string[] = []
+        // ⚠ ok=false 时第一行必须是拒绝原因：否则 render 只印档位行，
+        // 我会把一次「没执行」读成「执行了」（2026-11-09 实测：full 被拒后只显示档位行，
+        // 看不出拒绝，还以为切了）。
+        if (r.ok === false) {
+          lines.push('✖ 未执行：' + (r.reason ?? '（无原因）'))
+        }
         if (r.mode === 'full') {
           lines.push(`工具面 [full] 全局面 ${total} 个工具可见（收窄已解除）`)
         } else if (r.sticky === true) {
@@ -563,6 +697,12 @@ export function apply(ctx: Context, config: Config): void {
             `· 域外地板：${r.outside.tools ?? 0} 个工具 / ${r.outside.tokens ?? 0} tok（永不被收窄）`,
           )
         }
+        const pickedList = Array.isArray(r.picked) ? r.picked : []
+        if (pickedList.length > 0) {
+          lines.push(
+            `· 单独放行 ${pickedList.length} 个（pick 单工具粒度，不占整域）：${pickedList.join(', ')}`,
+          )
+        }
         const costs = Array.isArray(r.domainCosts) ? r.domainCosts : []
         if (costs.length > 0) {
           // 域成本让「切之前先知道代价」成为可能；已开的标 ·已开，省得再回头查 status。
@@ -598,11 +738,35 @@ export function apply(ctx: Context, config: Config): void {
         ? input.name.filter((v): v is string => typeof v === 'string')
         : (typeof input.name === 'string' ? input.name.split(',') : [])
       const domainNames = [...new Set(rawNames.map(n => n.trim()).filter(n => n !== ''))]
-      const knownDomains = Object.keys(config.domains).sort()
+      const knownDomains = Object.keys(domains).sort()
 
       // 同一请求只取一份 schema 快照（宿主每次调用都对全部工具深克隆，见 applyMode 注释）。
       let face: ToolSchemaLike[]
       if (action === 'lean' || action === 'full') {
+        // 主人 2026-11-09：**除特殊情况禁止开 full**。
+        // 做成机制而不是记性：没有 reason 的 full 直接拒绝，不给「顺手开一下」留路径。
+        const fullWhy = typeof (args as { reason?: unknown } | undefined)?.reason === 'string'
+          ? ((args as { reason?: string }).reason ?? '').trim()
+          : ''
+        if (action === 'full' && fullWhy === '') {
+          face = tools.schemas()
+          return {
+            ok: false,
+            mode,
+            openDomains: [...currentDomains],
+            domains: knownDomains,
+            applied,
+            deniedCount: config.sticky ? gatedSet.size : denied.length,
+            globalTools: face.length,
+            savedChars: 0,
+            savedTokens: 0,
+            unmatched,
+            picked: [...pinned].sort(),
+            reason: 'action=full 被拒绝：必须带 reason 说明为什么需要全量可见。'
+              + '绝大多数场景应改用 action=pick name="工具名"（只要那一个工具的代价），'
+              + '或 action=open name="域id"（要一整套时）。',
+          }
+        }
         face = applyMode(action, override, action)
       } else if (action === 'domain') {
         // 替换语义（v0.2 行为不变）：只开给定的这些域；不给 name = 只常驻。
@@ -642,6 +806,62 @@ export function apply(ctx: Context, config: Config): void {
         face = isNoop
           ? tools.schemas()
           : applyMode('domain', undefined, auditAction, remain)
+      } else if (action === 'pick' || action === 'unpick') {
+        // 单工具粒度（主人 2026-11-09）：只放行/收回这几个具体工具，不动域。
+        if (domainNames.length === 0) {
+          face = tools.schemas()
+          return {
+            ok: false,
+            mode,
+            openDomains: [...currentDomains],
+            domains: knownDomains,
+            applied,
+            deniedCount: config.sticky ? gatedSet.size : denied.length,
+            globalTools: face.length,
+            savedChars: 0,
+            savedTokens: 0,
+            unmatched,
+            picked: [...pinned].sort(),
+            reason: `action=${action} 需要 name（具体的工具名，多个用逗号分隔）`,
+          }
+        }
+        // 精确名不匹配时绝不静默无效：拼错一个字母就让整个 pick 失效，用户还以为成了。
+        // 给相近候选（按子串双向匹配），因为我经常记不住工具全名。
+        const unknown = domainNames.filter(n => !seenNames.has(n))
+        if (action === 'pick' && unknown.length > 0) {
+          const near = [...seenNames]
+            .filter(name => domainNames.some(d => {
+              const q = d.toLowerCase()
+              return name.toLowerCase().includes(q) || q.includes(name.toLowerCase())
+            }))
+            .sort()
+            .slice(0, 15)
+          return {
+            ok: false,
+            mode,
+            openDomains: [...currentDomains],
+            domains: knownDomains,
+            applied,
+            deniedCount: config.sticky ? gatedSet.size : denied.length,
+            globalTools: tools.schemas().length,
+            savedChars: 0,
+            savedTokens: 0,
+            unmatched,
+            picked: [...pinned].sort(),
+            reason: `未知工具名：${unknown.join(', ')}`
+              + (near.length > 0
+                ? `；相近候选：${near.join(', ')}`
+                : '；没有相近的工具名（用 tool_find 查「我要做 X 该用哪个工具」）'),
+          }
+        }
+        if (action === 'pick') {
+          for (const n of domainNames) pinned.add(n)
+        } else {
+          for (const n of domainNames) pinned.delete(n)
+        }
+        // 用当前档位重算一遍：pinned 在 applyMode 内部从 deny 剔除，随即生效。
+        // ⚠ 传 currentDomains 而不是空数组——pick 不该把已开的域清掉。
+        face = applyMode(mode, undefined, action + ':' + domainNames.join('+'), currentDomains)
       } else if (action !== 'status') {
         face = tools.schemas()
         return {
@@ -655,7 +875,8 @@ export function apply(ctx: Context, config: Config): void {
           savedChars: 0,
           savedTokens: 0,
           unmatched,
-          reason: '未知 action "' + action + '"：只接受 status / lean / full / domain / open / close',
+          picked: [...pinned].sort(),
+          reason: '未知 action "' + action + '"：只接受 status / lean / full / domain / open / close / pick / unpick',
         }
       } else {
         face = tools.schemas()
@@ -663,8 +884,8 @@ export function apply(ctx: Context, config: Config): void {
 
       const cost = faceCost(face, denied)
       // 域成本与地板只在 domain 档有意义（lean/full 下域不参与决策，算了也是浪费）。
-      const costs = mode === 'domain' ? computeDomainCosts(face, config.domains) : undefined
-      const coverage = mode === 'domain' ? domainCoverage(face, config.domains) : undefined
+      const costs = mode === 'domain' ? computeDomainCosts(face, domains) : undefined
+      const coverage = mode === 'domain' ? domainCoverage(face, domains) : undefined
       return {
         ok: true,
         mode,
@@ -691,7 +912,61 @@ export function apply(ctx: Context, config: Config): void {
         savedChars: config.sticky ? 0 : cost.chars,
         savedTokens: config.sticky ? 0 : cost.tokens,
         unmatched,
+        picked: [...pinned].sort(),
         ...(reason === undefined ? {} : { reason }),
+      }
+    },
+  }))
+
+  // ── 按需执行通道（v0.6）─────────────────────────────────────────────────────
+  // 域内工具不进工具面（省掉的正是它们占的那部分上下文），但能力必须可达。
+  // 收窄只过滤 agent 视图、不注销注册；本工具用**全局视图**按名取定义再执行，
+  // 因此被收窄的工具在这里依然调得到（宿主机理见 ToolsLike.get 的注释）。
+  // ⚠ 它自己必须永不被收窄或门禁——通道一关，域内工具就再没有取用路径了。
+  ctx.tools.register(defineTool({
+    name: 'tool_call',
+    description: '按需执行当前未常驻的工具。'
+      + '域内工具不占上下文，用本工具按名调用：tool=工具名，args=该工具的参数对象（原样转交）。'
+      + '工具名与各域明细用 toolface({action:"status"}) 查，或查对应技能文档。'
+      + '参数不合法时返回该工具的报错原文，按提示修正后重试即可。'
+      + '已经直接可见的常驻工具请直接调用，不必经过本工具。',
+    parameters: {
+      tool: { type: 'string', required: true, description: '要执行的工具名（如 manor_find）' },
+      args: { type: 'object', additionalProperties: true, description: '传给该工具的参数对象；省略视为空对象' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render(_args, value) {
+        const r = value as Record<string, unknown>
+        if (r['ok'] === true) {
+          const body = r['result']
+          return [{ type: 'text', text: body === undefined ? '（无返回值）' : JSON.stringify(body, null, 2) }]
+        }
+        const error = String(r['error'] ?? '执行失败')
+        const hint = r['hint'] === undefined ? '' : `\n${String(r['hint'])}`
+        return [{ type: 'text', text: `✗ ${error}${hint}` }]
+      },
+    },
+    async execute(args, exec) {
+      const input = (args ?? {}) as { tool?: unknown; args?: unknown }
+      const target = typeof input.tool === 'string' ? input.tool.trim() : ''
+      if (target === '') return { ok: false, tool: null, error: 'tool 不能为空：给要执行的工具名', hint: null, result: null }
+      const definition = tools.get?.(target)
+      if (definition === undefined) {
+        return {
+          ok: false,
+          tool: target,
+          error: `未知工具：${target}`,
+          hint: '用 toolface({action:"status"}) 查各域工具明细；它在某个域里时也可以直接 toolface({action:"open", name:"域"}) 常驻它',
+          result: null,
+        }
+      }
+      const forwarded = input.args !== null && typeof input.args === 'object' ? input.args : {}
+      try {
+        const value = await definition.execute(forwarded, exec)
+        return { ok: true, tool: target, result: (value ?? null) as never, error: null, hint: null }
+      } catch (err) {
+        return { ok: false, tool: target, error: (err as Error).message, hint: null, result: null }
       }
     },
   }))

@@ -69,7 +69,8 @@ test('sticky：load 不调用 restrict（schema 恒定，零前缀改动）', as
   apply(fakeCtx(state), stickyConfig())
   assert.equal(state.restrictCalls.length, 0)
   assert.equal(state.lifted.length, 0)
-  assert.deepEqual(state.registered, ['toolface'])
+  assert.ok(state.registered.includes('toolface'), 'toolface 必须注册')
+  assert.ok(state.registered.includes('tool_call'), 'tool_call 是按需执行通道，必须注册')
 })
 
 test('sticky：只常驻时门禁拦住域内工具，放行常驻', async () => {

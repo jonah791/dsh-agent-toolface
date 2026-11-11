@@ -52,7 +52,7 @@ test('apply：lean 档把模式展开成具体工具名并调用 restrict', asyn
   apply(fakeCtx(state), { mode: 'lean', deny: ['sec_*', 'red_*', 'nope'] })
   assert.equal(state.restrictCalls.length, 1)
   assert.deepEqual(state.restrictCalls[0].deny, ['red_dir_brute', 'sec_hydra', 'sec_nmap'])
-  assert.deepEqual(state.registered, ['toolface'])
+  assert.ok(state.registered.includes('toolface'), 'toolface 必须注册')
   // v0.4 起除 tools/change 外还订阅 session/event（按需取用：调 skill 时自动开同名域）
   assert.deepEqual(state.events, ['tools/change', 'session/event'])
 })
@@ -67,7 +67,7 @@ test('apply：full 档不调用 restrict（零副作用）', async () => {
   const state = await freshState()
   apply(fakeCtx(state), { mode: 'full', deny: ['sec_*'] })
   assert.equal(state.restrictCalls.length, 0)
-  assert.deepEqual(state.registered, ['toolface'])
+  assert.ok(state.registered.includes('toolface'), 'toolface 必须注册')
 })
 
 test('apply：deny 全未命中时不调用 restrict（宿主对未知工具名抛错）', async () => {
@@ -86,7 +86,7 @@ test('apply：restrict 抛错时插件仍加载，错误落 logger', async () =>
   const state = await freshState()
   state.restrictThrows = true
   apply(fakeCtx(state), { mode: 'lean', deny: ['sec_*'] })
-  assert.deepEqual(state.registered, ['toolface'])
+  assert.ok(state.registered.includes('toolface'), 'toolface 必须注册')
   assert.equal(state.errors.some(e => e.includes('收窄失败')), true)
 })
 
@@ -198,7 +198,11 @@ test('status：报已开域 + 各域成本 + 域外地板（切之前先知道�
   await callTool(state, { action: 'open', name: 'cleanup,security' })
   const r = await callTool(state, { action: 'status' })
   assert.deepEqual([...r.openDomains].sort(), ['cleanup', 'security'])
-  assert.ok(Array.isArray(r.domainCosts) && r.domainCosts.length === 2)
+  // ⚠ 不写死 length：v0.6 起域表还会从技能目录的 tools.yml 合并（域数随技能库变化），
+  // 写死「正好 2 个」会让这条测试依赖外部技能目录的状态——按语义断言「已开域都在里面」。
+  assert.ok(Array.isArray(r.domainCosts) && r.domainCosts.length >= 2)
+  const costIds = r.domainCosts.map(c => c.id)
+  assert.ok(costIds.includes('cleanup') && costIds.includes('security'), '已开域的成本必须报出')
   assert.ok(r.domainCosts.every(c => typeof c.tools === 'number' && typeof c.tokens === 'number'))
   assert.equal(r.outside.tools, 2, 'read 与 red_dir_brute 在域外')
 })
