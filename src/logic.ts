@@ -281,6 +281,53 @@ export function domainCoverage(
   return { covered: covered.size, outside: outsideNames.length, outsideTokens: cost.tokens }
 }
 
+/** 一个域的体量读数（工具数；不算 token —— 这里刻意不碰 schema，见 indexLine 的注释）。 */
+export interface DomainSize {
+  id: string
+  tools: number
+}
+
+/**
+ * 各域的工具数（降序）。
+ * @param names - 已知工具名（累积集，不是当次可见面）。
+ * @param domains - 域定义表。
+ * @returns 按工具数降序、同数按 id 升序的域体量表。
+ */
+export function domainSizes(names: readonly string[], domains: DomainMap): DomainSize[] {
+  const rows: DomainSize[] = []
+  for (const [id, patterns] of Object.entries(domains)) {
+    rows.push({ id, tools: expandPatterns(patterns, names).matched.length })
+  }
+  return rows.sort((a, b) => (b.tools - a.tools) || a.id.localeCompare(b.id))
+}
+
+/**
+ * 每步注入的「工具域索引」一行。
+ *
+ * 存在理由（2026-11-12 事故）：我对着主人断言「库里没有删除工具」，而 `memory_merge`
+ * 一直在档案里——记忆工具按 `deferLoading` 声明成「按名调用、不占 schema」，于是
+ * **不在手边**被我读成了**不存在**。指路牌（`tool_find`）那天还因为整串匹配撒了谎。
+ *
+ * 判据取舍：一行索引 ≈ 一百多 token/步，覆盖全部工具；把同样这些工具**常驻**
+ * 要两三万 token/步，而且仍只是子集。**常驻目录，不常驻工具。**
+ *
+ * 刻意只数名字、不算 token：`domainCosts` 要读 schema（对每个工具深克隆 parameters，
+ * 274 工具 ≈ 8s）——那是用户主动查时才付的代价，不能挂在每步路径上。
+ * @param names - 已知工具名（累积集）。
+ * @param domains - 域定义表。
+ * @param max - 最多列几个域（其余折成「还有 N 域」）。
+ * @returns 一行索引；域表为空时返回空串（调用方据此跳过注入）。
+ */
+export function indexLine(names: readonly string[], domains: DomainMap, max = 12): string {
+  const sizes = domainSizes(names, domains).filter(size => size.tools > 0)
+  if (sizes.length === 0) return ''
+  const shown = sizes.slice(0, max).map(size => `${size.id} ${String(size.tools)}`).join(' · ')
+  const rest = sizes.length > max ? ` · …还有 ${String(sizes.length - max)} 域` : ''
+  return `工具域索引（${String(sizes.length)} 域 / ${String(names.length)} 工具；`
+    + '收窄≠不存在——按名调用不需要 schema，用 toolface(action="open", name=域) 或 tool_call）：'
+    + shown + rest
+}
+
 /** 审计行入参。 */
 export interface AuditEntry {
   at: string

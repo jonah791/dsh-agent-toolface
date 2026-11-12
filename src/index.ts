@@ -23,12 +23,23 @@ import {
   domainCoverage,
   expandPatterns,
   faceCost,
+  indexLine,
   parseMode,
   planDomain,
 } from './logic.ts'
 import type { ToolSchemaLike, ToolfaceMode } from './logic.ts'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 
 export const name = 'agent-toolface'
+
+/** 工具域索引注入行的 source kind（模型可见 ⟺ 已记录）。 */
+export const INDEX_SOURCE_KIND = 'toolface-index'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'toolface-index': { kind: 'toolface-index' }
+  }
+}
 
 /** 宿主 `tools` 服务的可见面（宽松声明：跨包不 import，避免版本耦合）。 */
 export const inject = ['tools'] as const
@@ -65,6 +76,21 @@ export interface Config {
    * ⚠ 默认 false 是**兼容决定**：其他挂载本插件的预设仍走「收窄」语义。
    */
   constantFace: boolean
+  /**
+   * 每步注入一行「工具域索引」（v0.7，2026-11-12 事故驱动）。
+   *
+   * 事故：我对主人断言「库里没有删除工具」，而 `memory_merge` 一直在档案里——
+   * 记忆工具按 `deferLoading` 声明成「按名调用、不占 schema」，于是**不在手边**
+   * 被我读成了**不存在**（指路牌 `tool_find` 当天还因整串匹配回了「无命中」）。
+   *
+   * 取舍：一行索引 ≈ 一百多 token/步，覆盖全部工具；把同样这些工具常驻要两三万
+   * token/步，而且仍只是子集。**常驻目录，不常驻工具。**
+   *
+   * ⚠ 默认 false 是**兼容决定**：注入会进请求前缀，不该由本插件替其他预设决定。
+   */
+  indexLine: boolean
+  /** 索引里最多列几个域（其余折成「还有 N 域」，缺省 12）。 */
+  indexLineMax: number
 }
 
 export const Config = z.object({
@@ -74,6 +100,8 @@ export const Config = z.object({
   resident: z.array(z.string()).default([]),
   sticky: z.boolean().default(false),
   constantFace: z.boolean().default(false),
+  indexLine: z.boolean().default(false),
+  indexLineMax: z.number().default(12),
 })
 
 interface ToolDefinitionLike {
@@ -194,6 +222,14 @@ export function apply(ctx: Context, config: Config): void {
   let applying = false
   /** 上一行审计的关键字段指纹（除时间戳外）——同状态不重复落盘。 */
   let lastAuditKey = ''
+  /**
+   * 工具域索引一行：只在工具名集合变化后重算，其余每步复用缓存。
+   *
+   * 为什么缓存：`domainCosts` 那条路要读 schema（对每个工具深克隆 parameters，274 工具 ≈ 8s），
+   * 而索引只需要名字——名字集合 `seenNames` 已经是累积的，重算只是几十次子串匹配。
+   */
+  let indexCached = ''
+  let indexDirty = true
 
   // ── v0.4 恒定 schema 的门禁状态 ─────────────────────────────────────────────
   // 开关不再改「可见工具集」（那会改请求头的 tools 数组 ⇒ 整条前缀作废），
@@ -323,6 +359,7 @@ export function apply(ctx: Context, config: Config): void {
     const face = tools.schemas()
     const allNames = face.map(s => s.name)
     for (const name of allNames) seenNames.add(name)
+    indexDirty = true
     /** deny 的作用域：累积名（只增不减），而不是当次快照——见 seenNames 的注释。 */
     const denyable = [...seenNames]
 
@@ -970,4 +1007,36 @@ export function apply(ctx: Context, config: Config): void {
       }
     },
   }))
+
+  // ── 每步一行「工具域索引」（config.indexLine） ───────────────────────────────
+  // 只在 domain 档注入：域是收窄的单位，也只有在收窄时「存在但看不见」才会发生。
+  // 按「会话 + 小时 + 内容」去重——同一小时同一份索引不重复刷，跨小时重新注入一次，
+  // 保证压缩之后还能再看到一次「有哪些域」（与主线账本同一套去重判据）。
+  if (config.indexLine) {
+    const seenIndex = new Set<string>()
+    ctx.on('agent/pre-step', (async (payload: any, next: any) => {
+      const decision = await next()
+      if (decision.kind !== 'enter') return decision
+      if (mode !== 'domain') return decision
+      if (indexDirty) {
+        indexCached = indexLine([...seenNames], domains, config.indexLineMax)
+        indexDirty = false
+      }
+      if (indexCached === '') return decision
+      const now = new Date()
+      const hour = `${String(now.getFullYear())}-${String(now.getMonth() + 1)}-${String(now.getDate())} `
+        + String(now.getHours())
+      const key = `${String(payload.agent?.session?.id ?? '')}|${hour}|${indexCached}`
+      if (seenIndex.has(key)) return decision
+      if (seenIndex.size >= 500) seenIndex.clear()
+      seenIndex.add(key)
+      return {
+        ...decision,
+        messages: [...decision.messages, createUserMessage({
+          content: [{ type: 'text', text: indexCached }],
+          source: { kind: INDEX_SOURCE_KIND },
+        })],
+      }
+    }) as any, { prepend: true })
+  }
 }

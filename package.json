@@ -1,36 +1,37 @@
 {
-    "name": "dsh-agent-toolface",
-    "version": "0.5.0",
-    "description": "工具面分档：在 agent 作用域内按证据化的 deny 集收窄模型可见工具（lean/full/domain 切换 + 审计留痕），降低工具 schema 的固定上下文成本与选择稀释。v0.3 起支持多域（open 累加 / close 移除），status 报每域成本与「域外地板」。v0.4 起可开 sticky：**schema 恒定、开关改走执行前门禁**——因为 tools 数组在缓存前缀最前面，每次切换都会让整条前缀重算（2026-11-09 实测单次 8 万–38 万 tokens）；sticky 下切换零前缀代价，变更只写进工具返回值（「只注入变更」）。v0.5 起「按需取用」：调 `skill({name})` 时若存在同名域且未开启则自动开域——道具跟着技能一起到手，不必人记得 `open`。",
-    "type": "module",
-    "main": "lib/index.js",
-    "types": "lib/types/index.d.ts",
-    "exports": {
-        ".": {
-            "types": "./lib/types/index.d.ts",
-            "default": "./lib/index.js"
-        },
-        "./package.json": "./package.json"
+  "name": "dsh-agent-toolface",
+  "version": "0.5.0",
+  "description": "工具面分档：在 agent 作用域内按证据化的 deny 集收窄模型可见工具（lean/full/domain 切换 + 审计留痕），降低工具 schema 的固定上下文成本与选择稀释。v0.3 起支持多域（open 累加 / close 移除），status 报每域成本与「域外地板」。v0.4 起可开 sticky：**schema 恒定、开关改走执行前门禁**——因为 tools 数组在缓存前缀最前面，每次切换都会让整条前缀重算（2026-11-09 实测单次 8 万–38 万 tokens）；sticky 下切换零前缀代价，变更只写进工具返回值（「只注入变更」）。v0.5 起「按需取用」：调 `skill({name})` 时若存在同名域且未开启则自动开域——道具跟着技能一起到手，不必人记得 `open`。",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
     },
-    "files": [
-        "lib",
-        "README.md",
-        "dsh-plugin.json"
-    ],
-    "license": "MIT",
-    "peerDependencies": {
-        "@deepseek-ai/cordis": "^4.0.1",
-        "@deepseek-ai/schemastery": "^3.18.1-rc.1",
-        "@deepseek-ai/dsh-tools": ">=0.1.0-rc.6"
-    },
-    "devDependencies": {
-        "@types/node": "^22.0.0",
-        "typescript": "^5.9.3"
-    },
-    "scripts": {
-        "prepare": "tsc -p tsconfig.json",
-        "build": "node node_modules/typescript/bin/tsc -p tsconfig.json",
-        "typecheck": "node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit",
-        "test": "node --test \"tests/*.test.mjs\""
-    }
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "README.md",
+    "dsh-plugin.json"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "^3.18.1-rc.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "prepare": "tsc -p tsconfig.json",
+    "build": "node node_modules/typescript/bin/tsc -p tsconfig.json",
+    "typecheck": "node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"tests/*.test.mjs\""
+  }
 }
