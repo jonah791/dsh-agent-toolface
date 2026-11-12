@@ -1010,10 +1010,22 @@ export function apply(ctx: Context, config: Config): void {
 
   // ── 每步一行「工具域索引」（config.indexLine） ───────────────────────────────
   // 只在 domain 档注入：域是收窄的单位，也只有在收窄时「存在但看不见」才会发生。
-  // 按「会话 + 小时 + 内容」去重——同一小时同一份索引不重复刷，跨小时重新注入一次，
-  // 保证压缩之后还能再看到一次「有哪些域」（与主线账本同一套去重判据）。
+  //
+  // ⚠ 重注入判据是**压缩**，不是时钟（2026-11-12 主人纠正）：
+  // 第一版按「会话 + 小时 + 内容」去重，那是拿现实时间当自身状态的标尺——
+  // 一小时内压缩两次，第二次丢了这行也要等下一个整点；一小时不压缩，却白白重注一遍。
+  // 真正的信号是上下文**被替换**这件事本身：`compaction/summary` 只在摘要落盘成功时追加
+  // （失败走 `compaction/end{error}`，上下文没换，不该触发）。
   if (config.indexLine) {
+    /** 已注入过的「会话 + 内容」键 —— 内容变了（域集合变了）就配得上再注一次。 */
     const seenIndex = new Set<string>()
+    /** 刚压缩过、索引已从可见上下文里消失的会话。用一次就清。 */
+    const compactedSessions = new Set<string>()
+    ctx.on('session/event', ((session: { readonly id?: unknown }, event: { readonly type?: string }) => {
+      if (event?.type !== 'compaction/summary') return
+      const id = String(session?.id ?? '')
+      if (id !== '') compactedSessions.add(id)
+    }) as any)
     ctx.on('agent/pre-step', (async (payload: any, next: any) => {
       const decision = await next()
       if (decision.kind !== 'enter') return decision
@@ -1023,11 +1035,10 @@ export function apply(ctx: Context, config: Config): void {
         indexDirty = false
       }
       if (indexCached === '') return decision
-      const now = new Date()
-      const hour = `${String(now.getFullYear())}-${String(now.getMonth() + 1)}-${String(now.getDate())} `
-        + String(now.getHours())
-      const key = `${String(payload.agent?.session?.id ?? '')}|${hour}|${indexCached}`
-      if (seenIndex.has(key)) return decision
+      const sid = String(payload.agent?.session?.id ?? '')
+      const afterCompaction = compactedSessions.delete(sid)
+      const key = `${sid}|${indexCached}`
+      if (seenIndex.has(key) && !afterCompaction) return decision
       if (seenIndex.size >= 500) seenIndex.clear()
       seenIndex.add(key)
       return {
