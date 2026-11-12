@@ -308,22 +308,34 @@ export function domainSizes(names: readonly string[], domains: DomainMap): Domai
  * 一直在档案里——记忆工具按 `deferLoading` 声明成「按名调用、不占 schema」，于是
  * **不在手边**被我读成了**不存在**。指路牌（`tool_find`）那天还因为整串匹配撒了谎。
  *
- * 判据取舍：一行索引 ≈ 一百多 token/步，覆盖全部工具；把同样这些工具**常驻**
- * 要两三万 token/步，而且仍只是子集。**常驻目录，不常驻工具。**
+ * 判据取舍（实测 2026-11-12：本机 23 域索引单行 344 字符 ≈ 215 token，**每小时最多注入一次**，
+ * 不是每步）：215 token/小时覆盖全部工具；把同样这些工具**常驻**要两三万 token/次请求，
+ * 而且仍只是子集。**常驻目录，不常驻工具。**
  *
  * 刻意只数名字、不算 token：`domainCosts` 要读 schema（对每个工具深克隆 parameters，
  * 274 工具 ≈ 8s）——那是用户主动查时才付的代价，不能挂在每步路径上。
  * @param names - 已知工具名（累积集）。
  * @param domains - 域定义表。
  * @param max - 最多列几个域（其余折成「还有 N 域」）。
+ * @param catchAllRatio - 兜底域判据（语义常数，不是部署选择）：覆盖 ≥ 此比例的域是兜底域
+ *   （本机 `everything: ['*']`，它把所有工具包起来好让它们默认不可见），**不是路由单位**——
+ *   「打开 everything」等于「全开」，列在索引第一位只会挤掉真正的域。
  * @returns 一行索引；域表为空时返回空串（调用方据此跳过注入）。
  */
-export function indexLine(names: readonly string[], domains: DomainMap, max = 12): string {
-  const sizes = domainSizes(names, domains).filter(size => size.tools > 0)
+export function indexLine(
+  names: readonly string[],
+  domains: DomainMap,
+  max = 12,
+  catchAllRatio = 0.9,
+): string {
+  const total = names.length
+  const sizes = domainSizes(names, domains)
+    .filter(size => size.tools > 0)
+    .filter(size => total === 0 || size.tools < total * catchAllRatio)
   if (sizes.length === 0) return ''
   const shown = sizes.slice(0, max).map(size => `${size.id} ${String(size.tools)}`).join(' · ')
   const rest = sizes.length > max ? ` · …还有 ${String(sizes.length - max)} 域` : ''
-  return `工具域索引（${String(sizes.length)} 域 / ${String(names.length)} 工具；`
+  return `工具域索引（${String(sizes.length)} 域 / ${String(total)} 工具；`
     + '收窄≠不存在——按名调用不需要 schema，用 toolface(action="open", name=域) 或 tool_call）：'
     + shown + rest
 }

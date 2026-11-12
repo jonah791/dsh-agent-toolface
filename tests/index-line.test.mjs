@@ -43,6 +43,15 @@ test('indexLine：没有域 / 域全空 ⇒ 空串（调用方据此跳过注入
   assert.equal(indexLine([], DOMAINS), '')
 })
 
+test('indexLine：兜底域（覆盖 ≥90%）不进索引——「打开 everything」等于全开，不是路由单位', () => {
+  const names = ['a_1', 'a_2', 'a_3', 'b_1']
+  const domains = { a: ['a_*'], b: ['b_*'], everything: ['*'] }
+  const line = indexLine(names, domains)
+  assert.doesNotMatch(line, /everything/)
+  assert.match(line, /a 3/)
+  assert.match(line, /b 1/)
+})
+
 test('indexLine：实测长度可控（12 域满配 < 700 字符）', () => {
   const names = []
   const domains = {}
