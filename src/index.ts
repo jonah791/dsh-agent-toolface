@@ -275,15 +275,19 @@ export function apply(ctx: Context, config: Config): void {
       }
       gateLift = undefined
     }
-    const guard = tools.guard
-    if (guard === undefined) {
+    // ⚠ 不能解构后用：`tools.guard` 是宿主 `ToolsService` 的**方法**，实现是
+    //   `guard(g) { return this.guards.effect(...) }`。解构成裸函数再调用，`this` 是
+    //   undefined ⇒ `Cannot read properties of undefined (reading 'guards')`
+    //   （2026-11-24 实测，堆栈落在 packages/core/tools/lib/index.js:651）。
+    //   必须带着接收者调用：`tools.guard(...)`。
+    if (tools.guard === undefined) {
       if (gatedSet.size > 0) {
         logger.warn('宿主无 tools.guard()：sticky 下门禁不可用，被门禁的工具实际仍可调用')
       }
       return
     }
     if (gatedSet.size === 0) return
-    gateLift = guard((execution) => {
+    gateLift = tools.guard((execution) => {
       const n = execution.name
       // 门禁热路径：先查集合，再做任何字符串工作。
       if (typeof n !== 'string' || GATE_EXEMPT.has(n) || !gatedSet.has(n)) return undefined
@@ -465,6 +469,33 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   applyMode(mode, undefined, 'load')
+
+  // ── 关于「从模型请求里移除工具」的落点（判据，勿再从组装侧下手）─────────────────
+  //
+  // 结论：**本插件不碰 `system-prompt/assemble`**。收窄只有一个落点——agent scope 的
+  // `tools.restrict()`；本插件挂在 preset 行时天然就在那个 scope 里。
+  //
+  // 依据（2026-11-24 读 0.2.3-alpha.2 源码确认，三条互相独立）：
+  //   ① `system-prompt/assemble` 的载荷类型是 `PromptPresentation`，字段只有
+  //      `sections` / `contexts` / `variables`——**没有 `tools`**
+  //      （packages/core/system-prompt/src/index.ts:167）。JSDoc 明写
+  //      "Tool declarations remain provider-owned."
+  //   ② `tools` 是宿主在 waterfall **之外**算好再拼回去的
+  //      （同上 :790 `const tools = orderTools(...)`；:823 `{ ...presentation, tools }`），
+  //      所以即使往 waterfall 返回值里塞 `tools`，也会被宿主的 `tools` 覆盖。
+  //   ③ 收窄的正规路径是 agent 视图：preset registry 的 `join()` 里
+  //      `bindScopeParent(agentKey, presetKey)`（packages/preset/agent-preset-registry/src/index.ts:281），
+  //      agent 的 scope 链继承 preset scope 的 layer ⇒ 在 preset 挂载的插件里调
+  //      `tools.restrict()` 就作用于该 agent 的模型请求。
+  //
+  // ⚠ v0.6 曾在此处加过一个 `global: true` 的 assemble 钩子去 `assembly.tools.filter(...)`。
+  //   它基于「assembly 含 tools」的错误假设，在 0.2.3 上**每个 turn 必然抛**
+  //   `Cannot read properties of undefined (reading 'filter')`（会话侧显示「本轮运行失败」）。
+  //   已撤销，且不要再加回来。
+  //
+  // ⚠ 顶层挂载（`toolface-host`，无 agent scope）**不要**配 `sticky: false`：
+  //   `restrict()` 会被宿主结构性拒绝（tools/src/index.ts:165 "requires a scoped context"）。
+  //   那份的职责是全局门禁（guard）+ 每步一行域索引（indexLine），收窄交给 preset 行。
 
   // 补挂：仅当未命中的模式**变少**（说明确有新工具注册进来）时才重试，且次数封顶。
   //
